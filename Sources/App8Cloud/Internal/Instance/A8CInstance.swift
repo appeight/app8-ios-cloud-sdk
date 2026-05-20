@@ -132,6 +132,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         self.telemetry = telemetryClient
 
         ds.bind(bridge: self)
+        ds.bind(telemetry: telemetryClient)
 
         telemetryClient?.enqueue(.init(
             type: "sdk_init",
@@ -148,11 +149,28 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     // MARK: - Identity (Instance protocol)
 
     func setAttributes(_ attributes: [String: String]) {
-        attributeBag.setAttributes(attributes)
+        let rejected = attributeBag.setAttributes(attributes)
+        guard let telemetry else { return }
+        telemetry.enqueue(.init(
+            type: "attributes_set",
+            occurredAt: Date(),
+            screenKey: nil,
+            context: [
+                "count": attributes.count - rejected.count,
+                "droppedReservedCount": rejected.count
+            ]
+        ))
     }
 
     func clearAttributes() {
         attributeBag.clearAttributes()
+        guard let telemetry else { return }
+        telemetry.enqueue(.init(
+            type: "attributes_cleared",
+            occurredAt: Date(),
+            screenKey: nil,
+            context: nil
+        ))
     }
 
     var currentAttributes: [String: String] {
@@ -183,10 +201,15 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             let renderMs = Int(Date().timeIntervalSince(renderStart) * 1000)
             let totalMs = Int(Date().timeIntervalSince(started) * 1000)
             log.info("[Render] screen(id='\(id)') done — fonts \(fontsMs)ms, render \(renderMs)ms, total \(totalMs)ms")
-            fireRenderEvent(screenId: id, started: started)
+            fireRenderEvent(kind: "screen", screenId: id, requestedVersion: version, started: started)
             return vc
+        } catch let cloudError as App8Cloud.Error {
+            emitRenderFailedTelemetry(kind: "screen", screenId: id, requestedVersion: version, error: cloudError)
+            throw cloudError
         } catch let e as App8.Error {
-            throw App8Cloud.Error.engine(e)
+            let cloudError = App8Cloud.Error.engine(e)
+            emitRenderFailedTelemetry(kind: "screen", screenId: id, requestedVersion: version, error: cloudError)
+            throw cloudError
         }
     }
 
@@ -194,10 +217,15 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         let started = Date()
         do {
             let vc = try await engine.startApp()
-            fireRenderEvent(screenId: "<app>", started: started)
+            fireRenderEvent(kind: "app", screenId: appRenderScreenKey, requestedVersion: version, started: started)
             return vc
+        } catch let cloudError as App8Cloud.Error {
+            emitRenderFailedTelemetry(kind: "app", screenId: appRenderScreenKey, requestedVersion: version, error: cloudError)
+            throw cloudError
         } catch let e as App8.Error {
-            throw App8Cloud.Error.engine(e)
+            let cloudError = App8Cloud.Error.engine(e)
+            emitRenderFailedTelemetry(kind: "app", screenId: appRenderScreenKey, requestedVersion: version, error: cloudError)
+            throw cloudError
         }
     }
 
@@ -287,13 +315,47 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             screenId: nil,
             source: .app
         ))
-        emitFallbackTelemetry(error: error, screenId: nil)
+        emitFallbackTelemetry(error: error, screenId: appRenderScreenKey)
         return vc
+    }
+
+    /// Synthetic `screenKey` so app-level render events join consistently
+    /// across `screen_render`, `screen_render_failed`, and `render_fallback`.
+    private let appRenderScreenKey: String = "<app>"
+
+    private func emitRenderFailedTelemetry(
+        kind: String,
+        screenId: String?,
+        requestedVersion: String?,
+        error: App8Cloud.Error
+    ) {
+        guard let telemetry else { return }
+        var ctx: [String: Any] = [
+            "kind": kind,
+            "reason": telemetryReasonString(error)
+        ]
+        if let requestedVersion { ctx["requestedVersion"] = requestedVersion }
+        if case let .dslVersionUnsupported(found, max) = error {
+            ctx["dslVersionRequired"] = found
+            ctx["dslVersionClientMax"] = max
+        }
+        if case let .screenVersionNotFound(_, version) = error {
+            ctx["version"] = version
+        }
+        if case let .serverError(status, _) = error {
+            ctx["status"] = status
+        }
+        telemetry.enqueue(.init(
+            type: "screen_render_failed",
+            occurredAt: Date(),
+            screenKey: screenId,
+            context: ctx
+        ))
     }
 
     private func emitFallbackTelemetry(error: App8Cloud.Error, screenId: String?) {
         guard let telemetry else { return }
-        var ctx: [String: Any] = ["reason": fallbackReasonString(error)]
+        var ctx: [String: Any] = ["reason": telemetryReasonString(error)]
         if case let .dslVersionUnsupported(found, max) = error {
             ctx["required"] = found
             ctx["clientMax"] = max
@@ -312,22 +374,12 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         ))
     }
 
-    private func fallbackReasonString(_ error: App8Cloud.Error) -> String {
-        switch error {
-        case .authInvalid:                 return "auth_invalid"
-        case .appNotFound:                 return "app_not_found"
-        case .screenNotFound:               return "screen_not_found"
-        case .screenVersionNotFound:        return "screen_version_not_found"
-        case .noNetwork:                   return "network_unavailable"
-        case .timeout:                     return "timeout"
-        case .serverError:                 return "server_error"
-        case .decodeFailed:                return "decode_failed"
-        case .dslVersionUnsupported:        return "dsl_version_unsupported"
-        case .engine:                      return "engine_error"
-        }
-    }
-
-    private func fireRenderEvent(screenId: String, started: Date) {
+    private func fireRenderEvent(
+        kind: String,
+        screenId: String,
+        requestedVersion: String?,
+        started: Date
+    ) {
         let durationMs = Int(Date().timeIntervalSince(started) * 1000)
         let served = lastServedVersions[screenId] ?? nil
         let fromCache = lastServedFromCache[screenId] ?? false
@@ -338,11 +390,25 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             fromCache: fromCache
         )
         onScreenRendered?(event)
+        guard let telemetry else { return }
+        var ctx: [String: Any] = [
+            "kind": kind,
+            "durationMs": durationMs,
+            "fromCache": fromCache
+        ]
+        if let requestedVersion { ctx["requestedVersion"] = requestedVersion }
+        if let served { ctx["servedVersion"] = served }
+        telemetry.enqueue(.init(
+            type: "screen_render",
+            occurredAt: Date(),
+            screenKey: screenId,
+            context: ctx
+        ))
     }
 
     // MARK: - Preload (Instance protocol)
 
-    private var inFlightPrefetch: Task<Void, Never>?
+    private var inFlightPrefetch: Task<PrefetchSummary, Never>?
 
     func prefetch(
         screens: [App8Cloud.PrefetchTarget],
@@ -352,9 +418,11 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
 
         let log = self.log
         let ds = self.dataSource
+        let started = Date()
+        let screenCount = screens.count
         let task = Task.detached { [weak self] in
-            guard self != nil else { return }
-            await Self.runPrefetch(
+            guard self != nil else { return PrefetchSummary() }
+            return await Self.runPrefetch(
                 dataSource: ds,
                 screens: screens,
                 includingAssets: includingAssets,
@@ -362,9 +430,16 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             )
         }
         inFlightPrefetch = task
-        await task.value
+        let summary = await task.value
         // Only clear if a later prefetch call hasn't already replaced it.
         if inFlightPrefetch == task { inFlightPrefetch = nil }
+        emitPrefetchTelemetry(
+            scope: "specific",
+            screenCount: screenCount,
+            summary: summary,
+            includingAssets: includingAssets,
+            started: started
+        )
     }
 
     /// Union backend `/screens` + engine BFS; backend wins (has version pins).
@@ -419,9 +494,11 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             log.info("[Prefetch] discovered \(targets.count) screen(s) in \(discoveryMs)ms (backend \(publishedTargets.count) + BFS \(bfsTargets.count) unioned): \(targets.map(\.id).sorted())")
         }
 
+        let started = Date()
+        let screenCount = targets.count
         let task = Task.detached { [weak self] in
-            guard self != nil else { return }
-            await Self.runPrefetch(
+            guard self != nil else { return PrefetchSummary() }
+            return await Self.runPrefetch(
                 dataSource: ds,
                 screens: targets,
                 includingAssets: includingAssets,
@@ -429,9 +506,42 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             )
         }
         inFlightPrefetch = task
-        await task.value
+        let summary = await task.value
         // Only clear if a later prefetch call hasn't already replaced it.
         if inFlightPrefetch == task { inFlightPrefetch = nil }
+        emitPrefetchTelemetry(
+            scope: "all",
+            screenCount: screenCount,
+            summary: summary,
+            includingAssets: includingAssets,
+            started: started
+        )
+    }
+
+    private func emitPrefetchTelemetry(
+        scope: String,
+        screenCount: Int,
+        summary: PrefetchSummary,
+        includingAssets: Bool,
+        started: Date
+    ) {
+        guard let telemetry else { return }
+        let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+        let ctx: [String: Any] = [
+            "scope": scope,
+            "screenCount": screenCount,
+            "successCount": summary.successCount,
+            "failureCount": summary.failureCount,
+            "includingAssets": includingAssets,
+            "cancelled": summary.cancelled,
+            "durationMs": durationMs
+        ]
+        telemetry.enqueue(.init(
+            type: "prefetch_completed",
+            occurredAt: Date(),
+            screenKey: nil,
+            context: ctx
+        ))
     }
 
     func cancelPrefetch() {
@@ -445,12 +555,19 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         return result != .orderedDescending
     }
 
+    struct PrefetchSummary: Sendable {
+        var successCount: Int = 0
+        var failureCount: Int = 0
+        var cancelled: Bool = false
+    }
+
     private static func runPrefetch(
         dataSource: RenderingDataSource,
         screens: [App8Cloud.PrefetchTarget],
         includingAssets: Bool,
         log: Diagnostics
-    ) async {
+    ) async -> PrefetchSummary {
+        var summary = PrefetchSummary()
         do {
             let appStarted = Date()
             _ = try await dataSource.getApp()
@@ -474,17 +591,17 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         }
 
         // Per-screen warm with bounded parallelism (4).
-        guard !screens.isEmpty else { return }
-        await withTaskGroup(of: Void.self) { group in
+        guard !screens.isEmpty else { return summary }
+        // Per-task outcome: .success, .failure, or .cancelled (excluded from counts).
+        enum Outcome { case success, failure, cancelled }
+        await withTaskGroup(of: Outcome.self) { group in
             let bound = 4
-            var inFlight = 0
             var iterator = screens.makeIterator()
 
             func enqueueNext() {
                 guard let target = iterator.next() else { return }
-                inFlight += 1
                 group.addTask {
-                    if Task.isCancelled { return }
+                    if Task.isCancelled { return .cancelled }
                     let screenStart = Date()
                     let dslStart = Date()
                     do {
@@ -492,13 +609,13 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
                             id: target.id, version: target.version
                         )
                     } catch {
-                        if Task.isCancelled { return }
+                        if Task.isCancelled { return .cancelled }
                         log.warning("[Prefetch] screen '\(target.id)' " +
                                     "(version=\(target.version ?? "latest")) DSL fetch failed: \(error)")
-                        return
+                        return .failure
                     }
                     let dslMs = Int(Date().timeIntervalSince(dslStart) * 1000)
-                    if Task.isCancelled { return }
+                    if Task.isCancelled { return .cancelled }
                     var assetsMs = 0
                     if includingAssets {
                         let assetsStart = Date()
@@ -509,16 +626,22 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
                     }
                     let totalMs = Int(Date().timeIntervalSince(screenStart) * 1000)
                     log.info("[Prefetch] screen '\(target.id)' done — DSL \(dslMs)ms, assets \(assetsMs)ms, total \(totalMs)ms")
+                    return .success
                 }
             }
 
             for _ in 0..<min(bound, screens.count) { enqueueNext() }
-            for await _ in group {
-                inFlight -= 1
+            for await outcome in group {
+                switch outcome {
+                case .success: summary.successCount += 1
+                case .failure: summary.failureCount += 1
+                case .cancelled: summary.cancelled = true
+                }
                 if Task.isCancelled { break }
                 enqueueNext()
             }
         }
+        return summary
     }
 
     // MARK: - Cache (Instance protocol)

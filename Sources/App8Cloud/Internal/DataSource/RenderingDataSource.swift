@@ -41,6 +41,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     private let cache: DiskCache?
     private let assetCache: AssetCache?
     private let fontRegistry: FontRegistry
+    @MainActor private weak var telemetry: TelemetryClient?
 
     private struct AssetState: Sendable {
         var manifest: AssetManifestEntries?
@@ -81,6 +82,12 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     @MainActor
     func bind(engine: App8.Instance) {
         self.engine = engine
+    }
+
+    /// Weak — `A8CInstance` strong-holds `telemetry` for the SDK's lifetime.
+    @MainActor
+    func bind(telemetry: TelemetryClient?) {
+        self.telemetry = telemetry
     }
 
     // MARK: - Cache reset
@@ -210,9 +217,15 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         }
         let entryId = entry.id
         let client = self.client
-        let data = try await coalescer.run(key: "asset:\(entryId)") {
-            let result = try await client.getRawURL(url)
-            return result.data
+        let data: Data
+        do {
+            data = try await coalescer.run(key: "asset:\(entryId)") {
+                let result = try await client.getRawURL(url)
+                return result.data
+            }
+        } catch {
+            await emitAssetFetchFailed(assetId: entryId, error: error)
+            throw error
         }
         assetCache?.write(key: key, data: data)
         if entryId != key {
@@ -266,25 +279,48 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             return
         }
         log.info("[Prefetch] screen='\(id)' refs: images=\(refs.images.count) fonts=\(refs.fonts.count)")
-        let imagesToFetch: [App8.AssetReference] = refs.images.filter { ref in
-            let key = (ref.id ?? ref.name) ?? ""
-            guard !key.isEmpty else { return false }
-            return assetCache?.read(key: key) == nil
+        // Two image-prefetch paths:
+        //   1. Manifest-resolvable (id/name) — goes through `getAsset`, lands in
+        //      our disk-backed AssetCache; engine looks it up at render time.
+        //   2. Raw HTTPS URLs without id/name — warmed via URLSession.shared so
+        //      the response lands in URLCache.shared, which the engine's
+        //      ImageLoader URLSession (default config) consults transparently.
+        var manifestImagesToFetch: [App8.AssetReference] = []
+        var rawUrlsToFetch: [String] = []
+        var seenUrls = Set<String>()
+        for ref in refs.images {
+            let id = (ref.id?.isEmpty == false) ? ref.id : nil
+            let name = (ref.name?.isEmpty == false) ? ref.name : nil
+            if id != nil || name != nil {
+                let key = (id ?? name) ?? ""
+                if assetCache?.read(key: key) == nil {
+                    manifestImagesToFetch.append(ref)
+                }
+                continue
+            }
+            // URL-only ref. Defer the HTTPS check to `prefetchRawURL` so http
+            // URLs surface a warning there.
+            if let url = ref.url, !url.isEmpty, seenUrls.insert(url).inserted {
+                rawUrlsToFetch.append(url)
+            }
         }
         let fontsToFetch: [App8.FontReference] = refs.fonts.filter { ref in
             UIFont(name: ref.postScriptName, size: 1) == nil
         }
         // Log so render-time misses can be correlated to skipped prefetch entries.
-        if !imagesToFetch.isEmpty {
-            let keys = imagesToFetch.map { ($0.id ?? $0.name) ?? "?" }
-            log.info("[Prefetch] screen='\(id)' will fetch \(imagesToFetch.count) image(s): \(keys)")
+        if !manifestImagesToFetch.isEmpty {
+            let keys = manifestImagesToFetch.map { ($0.id ?? $0.name) ?? "?" }
+            log.info("[Prefetch] screen='\(id)' will fetch \(manifestImagesToFetch.count) image(s): \(keys)")
+        }
+        if !rawUrlsToFetch.isEmpty {
+            log.info("[Prefetch] screen='\(id)' will warm \(rawUrlsToFetch.count) raw URL(s): \(rawUrlsToFetch)")
         }
         if !fontsToFetch.isEmpty {
             let names = fontsToFetch.map(\.postScriptName)
             log.info("[Prefetch] screen='\(id)' will register \(fontsToFetch.count) font(s): \(names)")
         }
 
-        if imagesToFetch.isEmpty && fontsToFetch.isEmpty {
+        if manifestImagesToFetch.isEmpty && rawUrlsToFetch.isEmpty && fontsToFetch.isEmpty {
             log.info("[Prefetch] screen='\(id)' — nothing to fetch (\(refs.images.count) images, \(refs.fonts.count) fonts already warm).")
             return
         }
@@ -292,9 +328,10 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         let started = Date()
         await withTaskGroup(of: Void.self) { group in
             let bound = 4
-            // Interleave images and fonts behind a single bounded pool —
-            // they share the network and CPU budget anyway.
-            var imageIter = imagesToFetch.makeIterator()
+            // Interleave images, raw URLs, and fonts behind a single bounded
+            // pool — they share the network and CPU budget anyway.
+            var imageIter = manifestImagesToFetch.makeIterator()
+            var urlIter = rawUrlsToFetch.makeIterator()
             var fontIter = fontsToFetch.makeIterator()
             let log = self.log
 
@@ -308,6 +345,11 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                             log.warning("prefetchScreenImages: getAsset failed for id=\(imgRef.id ?? "nil") name=\(imgRef.name ?? "nil"): \(error)")
                         }
                     }
+                } else if let urlString = urlIter.next() {
+                    group.addTask { [weak self] in
+                        guard let self else { return }
+                        await self.prefetchRawURL(urlString)
+                    }
                 } else if let fontRef = fontIter.next() {
                     group.addTask { [weak self] in
                         guard let self else { return }
@@ -315,12 +357,39 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                     }
                 }
             }
-            let initial = min(bound, imagesToFetch.count + fontsToFetch.count)
+            let totalWork = manifestImagesToFetch.count + rawUrlsToFetch.count + fontsToFetch.count
+            let initial = min(bound, totalWork)
             for _ in 0..<initial { enqueueNext() }
             for await _ in group { enqueueNext() }
         }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
-        log.info("prefetchScreenImages: screen=\(id) — warmed \(imagesToFetch.count) image(s) + \(fontsToFetch.count) font(s) in \(ms)ms (skipped \(refs.images.count - imagesToFetch.count) cached images, \(refs.fonts.count - fontsToFetch.count) registered fonts).")
+        let skippedImages = refs.images.count - manifestImagesToFetch.count - rawUrlsToFetch.count
+        log.info("prefetchScreenImages: screen=\(id) — warmed \(manifestImagesToFetch.count) manifest image(s) + \(rawUrlsToFetch.count) raw URL(s) + \(fontsToFetch.count) font(s) in \(ms)ms (skipped \(skippedImages) cached images, \(refs.fonts.count - fontsToFetch.count) registered fonts).")
+    }
+
+    /// Warm `URLCache.shared` so the engine's `ImageLoader` (built from
+    /// `URLSessionConfiguration.default`) serves the render-time fetch from
+    /// cache. Depends on the origin sending usable `Cache-Control` /
+    /// `Expires` — common CDNs do. Coalesced so concurrent prefetches for
+    /// the same URL share one in-flight request.
+    private func prefetchRawURL(_ urlString: String) async {
+        guard let url = URL(string: urlString) else {
+            log.warning("[Prefetch] raw-URL skipped — invalid URL: '\(urlString)'")
+            return
+        }
+        guard url.scheme?.lowercased() == "https" else {
+            log.warning("[Prefetch] raw-URL skipped — non-HTTPS: '\(urlString)'")
+            return
+        }
+        let request = URLRequest(url: url, cachePolicy: .useProtocolCachePolicy)
+        do {
+            _ = try await coalescer.run(key: "rawurl:\(urlString)") {
+                let (data, _) = try await URLSession.shared.data(for: request)
+                return data
+            }
+        } catch {
+            log.warning("[Prefetch] raw-URL fetch failed: \(urlString) — \(error)")
+        }
     }
 
     /// Register fonts before render (prevents fallback). Idempotent.
@@ -405,6 +474,30 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         currentBridge()?.recordServed(version: version, fromCache: fromCache, forScreen: screenId)
     }
 
+    @MainActor
+    private func emitAssetFetchFailed(assetId: String, error: Swift.Error) {
+        // Cancellation isn't a failure; don't inflate failure counts with it.
+        if error is CancellationError { return }
+        guard let telemetry else { return }
+        var ctx: [String: Any] = ["assetId": assetId]
+        // `HTTPClient.sendWithRetry` maps URLError → App8Cloud.Error, so the
+        // `unknown` branch should be unreachable in practice.
+        if let cloudError = error as? App8Cloud.Error {
+            ctx["reason"] = telemetryReasonString(cloudError)
+            if case let .serverError(status, _) = cloudError {
+                ctx["status"] = status
+            }
+        } else {
+            ctx["reason"] = "unknown"
+        }
+        telemetry.enqueue(.init(
+            type: "asset_fetch_failed",
+            occurredAt: Date(),
+            screenKey: nil,
+            context: ctx
+        ))
+    }
+
     private func cacheKey(screenId: String, version: String?) -> String {
         "\(screenId)@\(version ?? CacheLayout.latestVersionSentinel)"
     }
@@ -466,6 +559,19 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             s.styles = finalStyles
             s.components = finalComponents
             s.componentsByDslId = finalComponentsByDslId
+            // Mark the loaders satisfied so `loadStylesIfNeeded` /
+            // `loadComponentsIfNeeded` don't later fetch the app-level
+            // endpoint and clobber the merged set (those endpoints REPLACE
+            // state, not merge). Assumes inline `response.styles` /
+            // `.components` is the complete set the engine will need for
+            // any subsequently-rendered screen — if the backend ever ships
+            // per-screen subsets, this flag has to gate on coverage instead.
+            if response.styles != nil {
+                s.stylesLoaded = true
+            }
+            if response.components != nil {
+                s.componentsLoaded = true
+            }
             if let dss = response.datasources {
                 for (path, blob) in dss { s.datasources[path] = blob }
             }

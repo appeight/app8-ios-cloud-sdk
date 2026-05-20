@@ -13,6 +13,9 @@ public enum App8Cloud {
     ///   - environment: Backend `/sdk/v1` base URL, via `.custom(URL)`.
     ///   - diskCache: On-disk cache policy; defaults to enabled.
     ///   - telemetry: Render/usage telemetry policy; defaults to enabled.
+    ///   - diagnosticLoggingEnabled: Emit SDK diagnostic logs to the unified
+    ///     log (subsystem `dev.app8.cloud`). Off by default; turn on during
+    ///     integration / debugging.
     ///   - maxSupportedDslVersion: Highest DSL version this build can render.
     @MainActor
     public static func instance(
@@ -21,6 +24,7 @@ public enum App8Cloud {
         environment: Environment,
         diskCache: DiskCachePolicy = .default,
         telemetry: TelemetryPolicy = .enabled,
+        diagnosticLoggingEnabled: Bool = false,
         maxSupportedDslVersion: String = "1.0"
     ) -> Instance {
         A8CInstance(
@@ -29,6 +33,7 @@ public enum App8Cloud {
             environment: environment,
             diskCachePolicy: diskCache,
             telemetryPolicy: telemetry,
+            diagnosticLoggingEnabled: diagnosticLoggingEnabled,
             maxSupportedDslVersion: maxSupportedDslVersion
         )
     }
