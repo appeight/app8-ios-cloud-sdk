@@ -264,6 +264,75 @@ final class TelemetryClientTests: XCTestCase {
         XCTAssertEqual(attempts.get(), 1)
     }
 
+    /// Every emitted event type round-trips through enqueue + flush. Catches
+    /// typos in `type` strings that compile but ship broken telemetry.
+    func testAllEmittedEventTypesReachWireBody() async {
+        let capturedBody = Locked<Data?>(nil)
+        MockURLProtocol.requestHandler = { [weak self] req in
+            capturedBody.set(self?.captureBody(from: req))
+            return (HTTPURLResponse(url: req.url!, statusCode: 202, httpVersion: nil, headerFields: nil)!,
+                    Data())
+        }
+        let client = makeTelemetry()
+
+        let now = Date(timeIntervalSince1970: 1_770_000_000)
+        let cases: [(type: String, screenKey: String?, context: [String: Any]?)] = [
+            ("sdk_init", nil, ["hostBundleId": "com.partner.app"]),
+            ("screen_render", "home", ["kind": "screen", "durationMs": 120, "fromCache": true]),
+            ("screen_render_failed", "home", ["kind": "screen", "reason": "server_error", "status": 500]),
+            ("render_fallback", "home", ["reason": "network_unavailable"]),
+            ("prefetch_completed", nil, ["scope": "specific", "screenCount": 3, "successCount": 3, "failureCount": 0, "cancelled": false]),
+            ("asset_fetch_failed", nil, ["assetId": "asset-1", "reason": "timeout"]),
+            ("attributes_set", nil, ["count": 2, "droppedReservedCount": 1]),
+            ("attributes_cleared", nil, nil),
+            ("custom", nil, ["name": "checkout_started"])
+        ]
+        for c in cases {
+            client.enqueue(TelemetryEvent(
+                type: c.type, occurredAt: now, screenKey: c.screenKey, context: c.context
+            ))
+        }
+        await client.flush()
+
+        guard let body = capturedBody.get(),
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let events = json["events"] as? [[String: Any]] else {
+            XCTFail("Failed to capture telemetry body."); return
+        }
+        let types = Set(events.compactMap { $0["type"] as? String })
+        for expected in cases.map(\.type) {
+            XCTAssertTrue(types.contains(expected), "Missing event type '\(expected)' in wire body. Got: \(types)")
+        }
+        // Spot-check: app-render failure carries kind + reason in context.
+        let renderFailed = events.first { $0["type"] as? String == "screen_render_failed" }
+        let ctx = renderFailed?["context"] as? [String: Any]
+        XCTAssertEqual(ctx?["reason"] as? String, "server_error")
+        XCTAssertEqual(ctx?["status"] as? Int, 500)
+        // attributes_cleared has no context — confirm the encoder omits it.
+        let cleared = events.first { $0["type"] as? String == "attributes_cleared" }
+        XCTAssertNil(cleared?["context"])
+    }
+
+    func testTelemetryReasonStringCoversEveryErrorCase() {
+        // Pins the wire string for every case. Exhaustiveness is enforced by
+        // the compiler; this test guards string stability across renames.
+        let cases: [(App8Cloud.Error, String)] = [
+            (.authInvalid, "auth_invalid"),
+            (.appNotFound(appId: "a"), "app_not_found"),
+            (.screenNotFound(screenId: "s"), "screen_not_found"),
+            (.screenVersionNotFound(screenId: "s", version: "v"), "screen_version_not_found"),
+            (.noNetwork(underlying: URLError(.notConnectedToInternet)), "network_unavailable"),
+            (.timeout, "timeout"),
+            (.serverError(status: 500, retryable: true), "server_error"),
+            (.decodeFailed(context: "x", underlying: NSError(domain: "test", code: 0)), "decode_failed"),
+            (.dslVersionUnsupported(found: "2.0", max: "1.0"), "dsl_version_unsupported"),
+            (.engine(.appInitFailed), "engine_error")
+        ]
+        for (err, expected) in cases {
+            XCTAssertEqual(telemetryReasonString(err), expected)
+        }
+    }
+
     func testSanitizeJSONDictDropsNonJSONValues() {
         struct Custom {}
         let raw: [String: Any] = [
