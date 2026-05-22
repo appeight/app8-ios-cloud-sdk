@@ -202,6 +202,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             let totalMs = Int(Date().timeIntervalSince(started) * 1000)
             log.info("[Render] screen(id='\(id)') done — fonts \(fontsMs)ms, render \(renderMs)ms, total \(totalMs)ms")
             fireRenderEvent(kind: "screen", screenId: id, requestedVersion: version, started: started)
+            schedulePresentedEvent(vc: vc, kind: "screen", screenId: id)
             return vc
         } catch let cloudError as App8Cloud.Error {
             emitRenderFailedTelemetry(kind: "screen", screenId: id, requestedVersion: version, error: cloudError)
@@ -218,6 +219,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         do {
             let vc = try await engine.startApp()
             fireRenderEvent(kind: "app", screenId: appRenderScreenKey, requestedVersion: version, started: started)
+            schedulePresentedEvent(vc: vc, kind: "app", screenId: appRenderScreenKey)
             return vc
         } catch let cloudError as App8Cloud.Error {
             emitRenderFailedTelemetry(kind: "app", screenId: appRenderScreenKey, requestedVersion: version, error: cloudError)
@@ -400,6 +402,49 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         if let served { ctx["servedVersion"] = served }
         telemetry.enqueue(.init(
             type: "screen_render",
+            occurredAt: Date(),
+            screenKey: screenId,
+            context: ctx
+        ))
+    }
+
+    /// Attaches a one-shot layout sentinel to the returned VC's view so we
+    /// can emit `screen_presented` once the host has sized the container.
+    /// No-op when telemetry is disabled.
+    private func schedulePresentedEvent(
+        vc: UIViewController,
+        kind: String,
+        screenId: String
+    ) {
+        guard telemetry != nil else { return }
+        LayoutSentinelView.attach(to: vc.view) { [weak self] size, traits in
+            self?.emitScreenPresented(
+                kind: kind,
+                screenId: screenId,
+                size: size,
+                traits: traits
+            )
+        }
+    }
+
+    private func emitScreenPresented(
+        kind: String,
+        screenId: String,
+        size: CGSize,
+        traits: UITraitCollection
+    ) {
+        guard let telemetry else { return }
+        let ctx: [String: Any] = [
+            "kind": kind,
+            "width": Double(size.width),
+            "height": Double(size.height),
+            "scale": Double(traits.displayScale),
+            "horizontalSizeClass": sizeClassString(traits.horizontalSizeClass),
+            "verticalSizeClass": sizeClassString(traits.verticalSizeClass),
+            "deviceIdiom": deviceIdiomString(traits.userInterfaceIdiom)
+        ]
+        telemetry.enqueue(.init(
+            type: "screen_presented",
             occurredAt: Date(),
             screenKey: screenId,
             context: ctx
@@ -590,9 +635,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             log.info("Prefetch: prepareFonts \(Int(Date().timeIntervalSince(fontsStarted) * 1000))ms")
         }
 
-        // Per-screen warm with bounded parallelism (4).
         guard !screens.isEmpty else { return summary }
-        // Per-task outcome: .success, .failure, or .cancelled (excluded from counts).
         enum Outcome { case success, failure, cancelled }
         await withTaskGroup(of: Outcome.self) { group in
             let bound = 4
@@ -677,5 +720,28 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     func recordServed(version: String?, fromCache: Bool, forScreen screenId: String) {
         lastServedVersions[screenId] = version
         lastServedFromCache[screenId] = fromCache
+    }
+}
+
+/// Stable wire strings — keep in sync with backend schema docs.
+func sizeClassString(_ cls: UIUserInterfaceSizeClass) -> String {
+    switch cls {
+    case .compact:     return "compact"
+    case .regular:     return "regular"
+    case .unspecified: return "unspecified"
+    @unknown default:  return "unspecified"
+    }
+}
+
+func deviceIdiomString(_ idiom: UIUserInterfaceIdiom) -> String {
+    switch idiom {
+    case .phone:       return "phone"
+    case .pad:         return "pad"
+    case .mac:         return "mac"
+    case .tv:          return "tv"
+    case .carPlay:     return "carPlay"
+    case .vision:      return "vision"
+    case .unspecified: return "unspecified"
+    @unknown default:  return "unspecified"
     }
 }

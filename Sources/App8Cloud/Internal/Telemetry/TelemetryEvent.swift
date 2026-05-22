@@ -3,6 +3,10 @@ import Foundation
 /// `type` is the discriminator. Valid values:
 /// - `sdk_init` — fires once per Instance init.
 /// - `screen_render` — fires on every successful screen or app render.
+/// - `screen_presented` — fires once the host has laid out the returned VC at
+///   a non-zero size. Carries the container dimensions and device idiom so we
+///   can see what surface partners are actually integrating us into. Won't
+///   fire if the VC is rendered but never installed in a window.
 /// - `screen_render_failed` — fires on every render failure (throwing or fallback path).
 /// - `render_fallback` — fires when the partner's fallback closure is actually invoked.
 /// - `prefetch_completed` — fires when a `prefetch(...)` / `prefetchAll(...)` batch finishes.
