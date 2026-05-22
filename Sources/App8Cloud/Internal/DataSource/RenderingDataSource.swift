@@ -243,9 +243,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         return disk.isEmpty ? nil : disk
     }
 
-    // Streaming is not supported by the cloud data source — these
-    // `App8DataSource` hooks always return nil so the engine falls back to
-    // the regular request/response fetch paths.
+    // Streaming unsupported — engine falls back to request/response fetches.
     func streamScreen(screenId: String) -> AsyncStream<Data>? { nil }
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
@@ -559,13 +557,10 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             s.styles = finalStyles
             s.components = finalComponents
             s.componentsByDslId = finalComponentsByDslId
-            // Mark the loaders satisfied so `loadStylesIfNeeded` /
-            // `loadComponentsIfNeeded` don't later fetch the app-level
-            // endpoint and clobber the merged set (those endpoints REPLACE
-            // state, not merge). Assumes inline `response.styles` /
-            // `.components` is the complete set the engine will need for
-            // any subsequently-rendered screen — if the backend ever ships
-            // per-screen subsets, this flag has to gate on coverage instead.
+            // Mark loaders satisfied so the app-level fetches don't later
+            // clobber the merged set (those endpoints REPLACE, not merge).
+            // Assumes inline styles/components are the complete set —
+            // revisit if backend ever ships per-screen subsets.
             if response.styles != nil {
                 s.stylesLoaded = true
             }
