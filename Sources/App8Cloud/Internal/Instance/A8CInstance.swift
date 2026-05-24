@@ -458,7 +458,8 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             screenId: screenId,
             servedVersion: served,
             durationMs: durationMs,
-            fromCache: fromCache
+            fromCache: fromCache,
+            servedLocale: engine.currentLocale
         )
         onScreenRendered?(event)
         guard let telemetry else { return }
@@ -694,6 +695,17 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             let componentsStarted = Date()
             _ = try await dataSource.getComponents()
             log.info("Prefetch: getComponents \(Int(Date().timeIntervalSince(componentsStarted) * 1000))ms")
+
+            // Non-fatal: a backend that hasn't deployed `/localizations`
+            // yet must not abort the rest of prefetch. Engine then leaves
+            // TranslationStore empty and i18n keys render as raw keys.
+            let localizationsStarted = Date()
+            do {
+                _ = try await dataSource.getTranslations()
+                log.info("Prefetch: getTranslations \(Int(Date().timeIntervalSince(localizationsStarted) * 1000))ms")
+            } catch {
+                log.warning("Prefetch: getTranslations skipped — \(error)")
+            }
         } catch {
             log.warning("Prefetch: app-level warm failed: \(error)")
         }

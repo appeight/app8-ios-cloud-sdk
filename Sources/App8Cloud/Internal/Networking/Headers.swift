@@ -14,9 +14,7 @@ struct HeaderBuilder: Sendable {
             "User-Agent": userAgent(),
             "Accept": "application/json",
         ]
-        if let lang = Locale.preferredLanguages.first {
-            h["Accept-Language"] = lang
-        }
+        // No Accept-Language: locale selection is client-side via TranslationStore.
         if let bundleId = Bundle.main.bundleIdentifier {
             h["X-App8-Host-Bundle-Id"] = bundleId
         }

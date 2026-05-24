@@ -9,6 +9,8 @@ enum Endpoint {
     case assetsManifest(appId: String)
     case listScreens(appId: String)
     case telemetry(appId: String)
+    /// Full all-locales bundle the engine loads into `TranslationStore`.
+    case localizations(appId: String)
 
     var path: String {
         switch self {
@@ -26,6 +28,8 @@ enum Endpoint {
             return "/apps/\(appId)/screens"
         case .telemetry(let appId):
             return "/apps/\(appId)/telemetry"
+        case .localizations(let appId):
+            return "/apps/\(appId)/localizations"
         }
     }
 
@@ -61,6 +65,8 @@ enum Endpoint {
             return "list-screens:\(appId)"
         case .telemetry(let appId):
             return "telemetry:\(appId)"
+        case .localizations(let appId):
+            return "localizations:\(appId)"
         }
     }
 

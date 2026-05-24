@@ -35,6 +35,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         var screensByCacheKey: [String: Data] = [:]
         var datasources: [String: Data] = [:]
         var allScreenIds: [String] = []
+        var localizations: Data?
     }
     private let state = OSAllocatedUnfairLock<State>(initialState: .init())
 
@@ -105,6 +106,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 s.screensByCacheKey = [:]
                 s.datasources = [:]
                 s.allScreenIds = []
+                s.localizations = nil
             }
             assetState.withLock { s in
                 s.manifest = nil
@@ -247,6 +249,23 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     func streamScreen(screenId: String) -> AsyncStream<Data>? { nil }
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
+
+    /// Full all-locales payload for `TranslationStore`. In-memory cached
+    /// (cleared by `resetInMemoryState`). Disk + host-bundle fallback: Phase 2.
+    func getTranslations() async throws -> Data {
+        if let cached = state.withLock({ $0.localizations }) {
+            return cached
+        }
+        let identity = await readIdentity()
+        let endpoint = Endpoint.localizations(appId: appId)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        state.withLock { $0.localizations = raw }
+        return raw
+    }
 
     // MARK: - Prefetch (no engine render — just cache warming)
 
