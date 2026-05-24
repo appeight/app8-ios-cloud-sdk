@@ -9,17 +9,21 @@ public extension App8Cloud {
         public let servedVersion: String?
         public let durationMs: Int
         public let fromCache: Bool
+        /// Locale used to resolve `{"$i18n": "..."}` on this render.
+        public let servedLocale: String
 
         public init(
             screenId: String,
             servedVersion: String?,
             durationMs: Int,
-            fromCache: Bool
+            fromCache: Bool,
+            servedLocale: String
         ) {
             self.screenId = screenId
             self.servedVersion = servedVersion
             self.durationMs = durationMs
             self.fromCache = fromCache
+            self.servedLocale = servedLocale
         }
     }
 }

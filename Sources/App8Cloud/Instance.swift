@@ -21,6 +21,15 @@ public extension App8Cloud {
 
         var currentAttributes: [String: String] { get }
 
+        // MARK: Locale
+
+        /// Override the locale for `{"$i18n": "..."}` text. Pass nil to revert
+        /// to the device default. Applies to subsequent renders only.
+        func setLocale(_ locale: String?)
+
+        /// Locale used on the next render: override → device default → bundle's `defaultLocale`.
+        var currentLocale: String { get }
+
         // MARK: Render
 
         /// version: nil → latest published; parameters seed DSL variables.
@@ -100,19 +109,8 @@ public extension App8Cloud {
 // MARK: - Locale passthrough to the underlying engine
 
 public extension App8Cloud.Instance {
-    /// Override the locale used by the underlying engine for `{"$i18n": ...}`
-    /// lookups and locale-aware formatters. Pass `nil` to revert to the
-    /// device default.
-    @MainActor
-    func setLocale(_ locale: String?) {
-        engine.setLocale(locale)
-    }
-
-    /// Active locale on the underlying engine. See `App8.Instance.currentLocale`.
-    @MainActor
-    var currentLocale: String {
-        engine.currentLocale
-    }
+    func setLocale(_ locale: String?) { engine.setLocale(locale) }
+    var currentLocale: String { engine.currentLocale }
 }
 
 // MARK: - Event + analytics convenience (mirrors App8.Instance)
