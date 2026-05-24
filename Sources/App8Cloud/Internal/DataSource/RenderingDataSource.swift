@@ -313,10 +313,12 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 if assetCache?.read(key: key) == nil {
                     manifestImagesToFetch.append(ref)
                 }
-                continue
             }
-            // URL-only ref. Defer the HTTPS check to `prefetchRawURL` so http
-            // URLs surface a warning there.
+            // Also warm an explicit URL whenever present — including alongside
+            // an id/name. Many templates carry both: a literal `id` plus a
+            // per-instance `url` resolved from a `{{var}}`. The render-time
+            // path prefers the URL when given, so the manifest fetch by itself
+            // can land in the disk cache but still miss the actual image bytes.
             if let url = ref.url, !url.isEmpty, seenUrls.insert(url).inserted {
                 rawUrlsToFetch.append(url)
             }
