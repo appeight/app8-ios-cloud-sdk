@@ -253,17 +253,10 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
 
-    /// Fetches the full all-locales payload from `/sdk/v1/apps/{appId}/localizations`.
-    /// The engine decodes this as `TranslationStore.Bundle`
-    /// (`{ defaultLocale, locales }`) and hands it to `TranslationStore.load(...)`
-    /// once at app boot. Method name keeps the iOS-internal `Translations`
-    /// vocabulary even though the backend route is `/localizations`.
-    ///
-    /// In-memory cached after first fetch so repeated calls (e.g. a second
-    /// `prefetchAll`, or a render-time consumer after prefetch) hit memory.
-    /// Cleared by `resetInMemoryState`. Disk cache + host-bundle fallback are
-    /// Phase 2; for now a network failure throws and the engine leaves
-    /// `TranslationStore` empty (i18n keys render as their key strings).
+    /// Full all-locales payload for `TranslationStore`. Cached in-memory
+    /// after first fetch (cleared by `resetInMemoryState`). On failure the
+    /// engine leaves `TranslationStore` empty — i18n keys render as their
+    /// key strings. Disk cache + host-bundle fallback are Phase 2.
     func getTranslations() async throws -> Data {
         if let cached = state.withLock({ $0.localizations }) {
             return cached

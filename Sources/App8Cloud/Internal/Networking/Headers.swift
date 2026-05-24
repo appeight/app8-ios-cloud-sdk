@@ -14,10 +14,7 @@ struct HeaderBuilder: Sendable {
             "User-Agent": userAgent(),
             "Accept": "application/json",
         ]
-        // Locale negotiation is NOT sent as a header. The translations
-        // endpoint always returns the full all-locales bundle in one
-        // payload, and the engine selects which locale to render against
-        // client-side via TranslationStore + instance.setLocale(...).
+        // No Accept-Language: locale selection is client-side via TranslationStore.
         if let bundleId = Bundle.main.bundleIdentifier {
             h["X-App8-Host-Bundle-Id"] = bundleId
         }

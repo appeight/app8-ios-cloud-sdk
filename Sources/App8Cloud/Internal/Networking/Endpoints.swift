@@ -9,9 +9,7 @@ enum Endpoint {
     case assetsManifest(appId: String)
     case listScreens(appId: String)
     case telemetry(appId: String)
-    /// `/sdk/v1/apps/{appId}/localizations` — full all-locales bundle the
-    /// engine loads into `TranslationStore`. The backend route was renamed
-    /// from `/translations` for naming consistency with the editor APIs.
+    /// Full all-locales bundle the engine loads into `TranslationStore`.
     case localizations(appId: String)
 
     var path: String {

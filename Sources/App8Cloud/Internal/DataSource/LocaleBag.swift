@@ -1,13 +1,9 @@
 import Foundation
 import os
 
-/// Holds an optional locale override set via `instance.setLocale(...)`.
-/// Mirrors `AttributeBag` — the same `OSAllocatedUnfairLock`-backed pattern,
-/// since the override is read from arbitrary contexts (header builder, render
-/// callbacks) and written from the main thread by the public API.
-///
-/// When `override` is nil the SDK reports the device's first preferred
-/// language; the engine then layers its own fallback (device → app default).
+/// Optional locale override set via `instance.setLocale(...)`. Read from
+/// arbitrary contexts, written from the main thread — same
+/// `OSAllocatedUnfairLock`-backed pattern as `AttributeBag`.
 final class LocaleBag: @unchecked Sendable {
 
     private struct State: Sendable {
@@ -25,9 +21,7 @@ final class LocaleBag: @unchecked Sendable {
         state.withLock { $0.override = locale.flatMap(Self.canonicalise) }
     }
 
-    /// Best-effort canonical locale: override → device default → "en".
-    /// Used as the public `currentLocale` value and (Phase 2+) for any
-    /// downstream cache-key namespacing.
+    /// Canonical locale: override → device default → "en".
     func currentLocale() -> String {
         if let o = state.withLock({ $0.override }) { return o }
         if let device = Locale.preferredLanguages.first, let canonical = Self.canonicalise(device) {
@@ -36,9 +30,7 @@ final class LocaleBag: @unchecked Sendable {
         return "en"
     }
 
-    /// The override value, if one was set. Distinct from `currentLocale()` —
-    /// callers that need to distinguish "explicitly set" vs "device default"
-    /// look here.
+    /// Override value if explicitly set, else nil. Distinct from `currentLocale()`.
     var overrideSnapshot: String? {
         state.withLock { $0.override }
     }

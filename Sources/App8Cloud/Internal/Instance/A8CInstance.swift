@@ -183,9 +183,6 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
 
     func setLocale(_ locale: String?) {
         localeBag.setOverride(locale)
-        // Push into the engine immediately so the next render — even one
-        // already in flight — sees the new locale. The translation table
-        // itself doesn't change; only the active-locale pointer flips.
         engine.setLocale(locale)
     }
 
@@ -648,9 +645,20 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             // TranslationStore + instance.setLocale(...). Warming here means
             // the first screen render doesn't pay an extra round-trip for
             // localized text resolution.
+            //
+            // NON-FATAL: a localization fetch failure (404 on a backend that
+            // hasn't deployed the route yet, network error, etc.) must not
+            // abort the rest of prefetch — assets, per-screen warm, and
+            // subsequent renders all proceed normally. The engine's
+            // TranslationStore just stays empty, so i18n keys render as their
+            // key string (or fall through to the host iOS bundle).
             let localizationsStarted = Date()
-            _ = try await dataSource.getTranslations()
-            log.info("Prefetch: getTranslations \(Int(Date().timeIntervalSince(localizationsStarted) * 1000))ms")
+            do {
+                _ = try await dataSource.getTranslations()
+                log.info("Prefetch: getTranslations \(Int(Date().timeIntervalSince(localizationsStarted) * 1000))ms")
+            } catch {
+                log.warning("Prefetch: getTranslations skipped — \(error). i18n keys will render via bundle fallback or as raw keys.")
+            }
         } catch {
             log.warning("Prefetch: app-level warm failed: \(error)")
         }
