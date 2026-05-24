@@ -250,6 +250,24 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
 
+    /// Fetches the full all-locales translations payload. The engine decodes
+    /// this as `TranslationStore.Bundle` (`{ defaultLocale, locales }`) and
+    /// hands it to `TranslationStore.load(...)` once at app boot.
+    ///
+    /// Phase 1: network-only. No disk cache, no host-bundle fallback — those
+    /// land in Phase 2. A network failure throws and the engine logs a
+    /// warning + leaves the store empty (i18n keys render as their key strings).
+    func getTranslations() async throws -> Data {
+        let identity = await readIdentity()
+        let endpoint = Endpoint.translations(appId: appId)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        return raw
+    }
+
     // MARK: - Prefetch (no engine render — just cache warming)
 
     func prefetchScreen(id: String, version: String?) async throws {

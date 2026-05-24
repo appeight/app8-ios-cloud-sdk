@@ -9,6 +9,7 @@ enum Endpoint {
     case assetsManifest(appId: String)
     case listScreens(appId: String)
     case telemetry(appId: String)
+    case translations(appId: String)
 
     var path: String {
         switch self {
@@ -26,6 +27,8 @@ enum Endpoint {
             return "/apps/\(appId)/screens"
         case .telemetry(let appId):
             return "/apps/\(appId)/telemetry"
+        case .translations(let appId):
+            return "/apps/\(appId)/translations"
         }
     }
 
@@ -61,6 +64,8 @@ enum Endpoint {
             return "list-screens:\(appId)"
         case .telemetry(let appId):
             return "telemetry:\(appId)"
+        case .translations(let appId):
+            return "translations:\(appId)"
         }
     }
 

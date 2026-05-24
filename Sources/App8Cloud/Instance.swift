@@ -21,6 +21,26 @@ public extension App8Cloud {
 
         var currentAttributes: [String: String] { get }
 
+        // MARK: Locale
+
+        /// Override the locale used when rendering `{"$i18n": "..."}` text in
+        /// the DSL. Passing nil reverts to the device's first preferred
+        /// language (`Locale.preferredLanguages.first`).
+        ///
+        /// The change applies to **subsequent renders** — already-visible
+        /// screens are not re-resolved in v1. Pop and re-push the current
+        /// screen if you need it to refresh immediately.
+        ///
+        /// Negotiation is client-side: the SDK has the full `{locale: {key:
+        /// value}}` map loaded at app boot, so flipping `setLocale` is an
+        /// in-memory pointer change — no network call.
+        func setLocale(_ locale: String?)
+
+        /// The locale string the SDK will use on the next render. Reflects
+        /// the most recent override; otherwise the device's first preferred
+        /// language; otherwise `"en"`.
+        var currentLocale: String { get }
+
         // MARK: Render
 
         /// version: nil → latest published; parameters seed DSL variables.

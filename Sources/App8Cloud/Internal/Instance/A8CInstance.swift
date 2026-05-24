@@ -20,6 +20,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     // MARK: - Stable infrastructure
 
     private let attributeBag: AttributeBag
+    private let localeBag: LocaleBag
     private let httpClient: HTTPClient
     private let assetCache: AssetCache?
     private let diskCache: DiskCache?
@@ -64,6 +65,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
 
         let bag = AttributeBag(diagnostics: log)
         self.attributeBag = bag
+        self.localeBag = LocaleBag(diagnostics: log)
 
         if let cfg = diskCacheConfig {
             let layout = CacheLayout(
@@ -175,6 +177,20 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
 
     var currentAttributes: [String: String] {
         attributeBag.snapshot
+    }
+
+    // MARK: - Locale (Instance protocol)
+
+    func setLocale(_ locale: String?) {
+        localeBag.setOverride(locale)
+        // Push into the engine immediately so the next render — even one
+        // already in flight — sees the new locale. The translation table
+        // itself doesn't change; only the active-locale pointer flips.
+        engine.setLocale(locale)
+    }
+
+    var currentLocale: String {
+        localeBag.currentLocale()
     }
 
     // MARK: - Render — throwing variants
@@ -387,7 +403,8 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             screenId: screenId,
             servedVersion: served,
             durationMs: durationMs,
-            fromCache: fromCache
+            fromCache: fromCache,
+            servedLocale: engine.currentLocale
         )
         onScreenRendered?(event)
         guard let telemetry else { return }
