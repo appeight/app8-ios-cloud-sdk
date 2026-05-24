@@ -80,5 +80,88 @@ public extension App8Cloud {
 
         @_spi(Advanced)
         var engine: App8.Instance { get }
+
+        // MARK: Event + Analytics buses (forwarded to engine)
+
+        /// Same `App8EventBus` instance the engine uses. Subscribe here OR
+        /// on `engine` — there is one bus per cloud Instance.
+        var eventBus: App8EventBus { get }
+
+        /// Same `App8AnalyticsBus` instance the engine uses. The cloud SDK
+        /// fires its render/fallback analytics events onto this bus too —
+        /// so a host's `App8AnalyticsHandler` sees `app8_render_failed`
+        /// alongside the engine's `app8_screen_appeared` etc.
+        var analyticsBus: App8AnalyticsBus { get }
+
+        var analyticsConfig: App8AnalyticsConfig { get set }
+    }
+}
+
+// MARK: - Locale passthrough to the underlying engine
+
+public extension App8Cloud.Instance {
+    /// Override the locale used by the underlying engine for `{"$i18n": ...}`
+    /// lookups and locale-aware formatters. Pass `nil` to revert to the
+    /// device default.
+    @MainActor
+    func setLocale(_ locale: String?) {
+        engine.setLocale(locale)
+    }
+
+    /// Active locale on the underlying engine. See `App8.Instance.currentLocale`.
+    @MainActor
+    var currentLocale: String {
+        engine.currentLocale
+    }
+}
+
+// MARK: - Event + analytics convenience (mirrors App8.Instance)
+
+public extension App8Cloud.Instance {
+
+    // MARK: Action events
+
+    @MainActor
+    @discardableResult
+    func subscribe(_ handler: @escaping (App8Event) -> Void) -> App8Subscription {
+        eventBus.subscribe(handler)
+    }
+
+    @MainActor
+    @discardableResult
+    func subscribe(to eventName: String, _ handler: @escaping (App8Event) -> Void) -> App8Subscription {
+        eventBus.subscribe(to: eventName, handler)
+    }
+
+    @MainActor
+    @discardableResult
+    func subscribe(onScreen screenId: String, _ handler: @escaping (App8Event) -> Void) -> App8Subscription {
+        eventBus.subscribe(onScreen: screenId, handler)
+    }
+
+    var events: AnyPublisher<App8Event, Never> { eventBus.publisher }
+
+    var eventStream: AsyncStream<App8Event> { eventBus.stream }
+
+    @MainActor
+    func setEventHandler(_ handler: App8EventHandler?) {
+        eventBus.delegate = handler
+    }
+
+    // MARK: Analytics events
+
+    @MainActor
+    @discardableResult
+    func observeAnalytics(_ handler: @escaping (App8AnalyticsEvent) -> Void) -> App8Subscription {
+        analyticsBus.subscribe(handler)
+    }
+
+    var analytics: AnyPublisher<App8AnalyticsEvent, Never> { analyticsBus.publisher }
+
+    var analyticsStream: AsyncStream<App8AnalyticsEvent> { analyticsBus.stream }
+
+    @MainActor
+    func setAnalyticsHandler(_ handler: App8AnalyticsHandler?) {
+        analyticsBus.delegate = handler
     }
 }

@@ -10,6 +10,15 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     var onScreenRendered: ((App8Cloud.RenderEvent) -> Void)?
     var onFallbackInvoked: ((App8Cloud.FallbackEvent) -> Void)?
 
+    // MARK: - Event + Analytics passthrough
+
+    var eventBus: App8EventBus { engine.eventBus }
+    var analyticsBus: App8AnalyticsBus { engine.analyticsBus }
+    var analyticsConfig: App8AnalyticsConfig {
+        get { engine.analyticsConfig }
+        set { engine.analyticsConfig = newValue }
+    }
+
     // MARK: - Init params
 
     private let appId: String
@@ -331,6 +340,36 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         requestedVersion: String?,
         error: App8Cloud.Error
     ) {
+        // Fire on the host-facing analytics bus independently of the cloud
+        // SDK's remote-telemetry POST opt-out (see `telemetry` below). Gated
+        // by the engine's `autoScreenEvents` flag — same gate the engine uses
+        // for `app8_screen_appeared` / `app8_screen_dismissed`, since
+        // `app8_render_failed` is a screen-lifecycle signal in the same family.
+        if engine.analyticsConfig.autoScreenEvents {
+            var props: [String: Any] = [
+                "kind": kind,
+                "reason": telemetryReasonString(error)
+            ]
+            if let requestedVersion { props["requestedVersion"] = requestedVersion }
+            if case let .dslVersionUnsupported(found, max) = error {
+                props["dslVersionRequired"] = found
+                props["dslVersionClientMax"] = max
+            }
+            if case let .screenVersionNotFound(_, version) = error {
+                props["version"] = version
+            }
+            if case let .serverError(status, _) = error {
+                props["status"] = status
+            }
+            engine.analyticsBus.dispatch(App8AnalyticsEvent(
+                name: "app8_render_failed",
+                screenId: screenId,
+                componentId: nil,
+                componentType: nil,
+                properties: props
+            ))
+        }
+
         guard let telemetry else { return }
         var ctx: [String: Any] = [
             "kind": kind,
@@ -356,6 +395,36 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     }
 
     private func emitFallbackTelemetry(error: App8Cloud.Error, screenId: String?) {
+        // Mirror `app8_render_failed`: hosts want fallback signal on the same
+        // bus they get screen-lifecycle events on, independent of the cloud
+        // SDK's remote-telemetry POST opt-out below. Gated by the engine's
+        // `autoScreenEvents` flag — `app8_render_fallback` is a
+        // screen-lifecycle signal in the same family.
+        if engine.analyticsConfig.autoScreenEvents {
+            let kind = (screenId == appRenderScreenKey) ? "app" : "screen"
+            var props: [String: Any] = [
+                "kind": kind,
+                "reason": telemetryReasonString(error)
+            ]
+            if case let .dslVersionUnsupported(found, max) = error {
+                props["dslVersionRequired"] = found
+                props["dslVersionClientMax"] = max
+            }
+            if case let .screenVersionNotFound(_, version) = error {
+                props["version"] = version
+            }
+            if case let .serverError(status, _) = error {
+                props["status"] = status
+            }
+            engine.analyticsBus.dispatch(App8AnalyticsEvent(
+                name: "app8_render_fallback",
+                screenId: screenId,
+                componentId: nil,
+                componentType: nil,
+                properties: props
+            ))
+        }
+
         guard let telemetry else { return }
         var ctx: [String: Any] = ["reason": telemetryReasonString(error)]
         if case let .dslVersionUnsupported(found, max) = error {
