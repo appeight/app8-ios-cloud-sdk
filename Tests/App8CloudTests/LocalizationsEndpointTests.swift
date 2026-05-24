@@ -1,8 +1,3 @@
-//
-//  LocalizationsEndpointTests.swift
-//  App8CloudTests
-//
-
 import XCTest
 @testable import App8Cloud
 
@@ -21,16 +16,12 @@ final class LocalizationsEndpointTests: XCTestCase {
     }
 
     func test_localizationsEndpointHasNoQueryItems() {
-        // Locale selection is client-side; the server always returns the
-        // full all-locales bundle. No ?locale= or Accept-Language fragmentation.
         let endpoint = Endpoint.localizations(appId: "ABC123")
         XCTAssertTrue(endpoint.queryItems.isEmpty)
     }
 
     func test_localizationsCoalesceKeyIsAppScoped() {
-        // The in-flight coalescer dedupes concurrent fetches by this key —
-        // scope must include appId so a second instance for a different
-        // app doesn't piggyback on the first instance's fetch.
+        // appId scope prevents a second instance piggybacking on the first instance's fetch.
         let a = Endpoint.localizations(appId: "app-1")
         let b = Endpoint.localizations(appId: "app-2")
         XCTAssertNotEqual(a.coalesceKey, b.coalesceKey)
@@ -43,11 +34,9 @@ final class LocalizationsEndpointTests: XCTestCase {
         XCTAssertEqual(url.absoluteString, "https://app8.example.com/sdk/v1/apps/ABC123/localizations")
     }
 
-    // MARK: - Headers (Accept-Language removal)
+    // MARK: - Headers (Accept-Language removal regression guard)
 
     func test_standardHeadersOmitsAcceptLanguage() {
-        // Phase 1 design dropped Accept-Language from the wire entirely —
-        // confirm no header smuggling slips back in. Regression guard.
         let builder = HeaderBuilder(
             token: "test-token",
             sdkVersion: "0.3.0",
@@ -59,7 +48,6 @@ final class LocalizationsEndpointTests: XCTestCase {
     }
 
     func test_standardHeadersStillIncludesAuthAndSDKVersion() {
-        // Sanity: the locale-related cleanup didn't break other headers.
         let builder = HeaderBuilder(
             token: "test-token",
             sdkVersion: "0.3.0",

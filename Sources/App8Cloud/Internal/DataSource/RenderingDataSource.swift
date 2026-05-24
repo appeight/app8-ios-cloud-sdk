@@ -35,9 +35,6 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         var screensByCacheKey: [String: Data] = [:]
         var datasources: [String: Data] = [:]
         var allScreenIds: [String] = []
-        /// Cached `/localizations` payload. Nil means not fetched yet — once
-        /// populated, repeated calls (e.g. a second `prefetchAll`) hit memory
-        /// instead of re-fetching. Cleared by `resetInMemoryState`.
         var localizations: Data?
     }
     private let state = OSAllocatedUnfairLock<State>(initialState: .init())
@@ -253,10 +250,8 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
 
-    /// Full all-locales payload for `TranslationStore`. Cached in-memory
-    /// after first fetch (cleared by `resetInMemoryState`). On failure the
-    /// engine leaves `TranslationStore` empty — i18n keys render as their
-    /// key strings. Disk cache + host-bundle fallback are Phase 2.
+    /// Full all-locales payload for `TranslationStore`. In-memory cached
+    /// (cleared by `resetInMemoryState`). Disk + host-bundle fallback: Phase 2.
     func getTranslations() async throws -> Data {
         if let cached = state.withLock({ $0.localizations }) {
             return cached
