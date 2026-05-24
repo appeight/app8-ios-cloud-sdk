@@ -279,6 +279,7 @@ final class TelemetryClientTests: XCTestCase {
         let cases: [(type: String, screenKey: String?, context: [String: Any]?)] = [
             ("sdk_init", nil, ["hostBundleId": "com.partner.app"]),
             ("screen_render", "home", ["kind": "screen", "durationMs": 120, "fromCache": true]),
+            ("screen_presented", "home", ["kind": "screen", "width": 390.0, "height": 844.0, "scale": 3.0, "horizontalSizeClass": "compact", "verticalSizeClass": "regular", "deviceIdiom": "phone"]),
             ("screen_render_failed", "home", ["kind": "screen", "reason": "server_error", "status": 500]),
             ("render_fallback", "home", ["reason": "network_unavailable"]),
             ("prefetch_completed", nil, ["scope": "specific", "screenCount": 3, "successCount": 3, "failureCount": 0, "cancelled": false]),
