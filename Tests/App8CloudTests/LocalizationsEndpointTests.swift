@@ -1,46 +1,46 @@
 //
-//  TranslationsEndpointTests.swift
+//  LocalizationsEndpointTests.swift
 //  App8CloudTests
 //
 
 import XCTest
 @testable import App8Cloud
 
-final class TranslationsEndpointTests: XCTestCase {
+final class LocalizationsEndpointTests: XCTestCase {
 
     // MARK: - Endpoint shape
 
-    func test_translationsEndpointPathMatchesBackendRoute() {
-        let endpoint = Endpoint.translations(appId: "ABC123")
-        XCTAssertEqual(endpoint.path, "/apps/ABC123/translations")
+    func test_localizationsEndpointPathMatchesBackendRoute() {
+        let endpoint = Endpoint.localizations(appId: "ABC123")
+        XCTAssertEqual(endpoint.path, "/apps/ABC123/localizations")
     }
 
-    func test_translationsEndpointIsGet() {
-        let endpoint = Endpoint.translations(appId: "ABC123")
+    func test_localizationsEndpointIsGet() {
+        let endpoint = Endpoint.localizations(appId: "ABC123")
         XCTAssertEqual(endpoint.method, "GET")
     }
 
-    func test_translationsEndpointHasNoQueryItems() {
+    func test_localizationsEndpointHasNoQueryItems() {
         // Locale selection is client-side; the server always returns the
         // full all-locales bundle. No ?locale= or Accept-Language fragmentation.
-        let endpoint = Endpoint.translations(appId: "ABC123")
+        let endpoint = Endpoint.localizations(appId: "ABC123")
         XCTAssertTrue(endpoint.queryItems.isEmpty)
     }
 
-    func test_translationsCoalesceKeyIsAppScoped() {
+    func test_localizationsCoalesceKeyIsAppScoped() {
         // The in-flight coalescer dedupes concurrent fetches by this key —
         // scope must include appId so a second instance for a different
         // app doesn't piggyback on the first instance's fetch.
-        let a = Endpoint.translations(appId: "app-1")
-        let b = Endpoint.translations(appId: "app-2")
+        let a = Endpoint.localizations(appId: "app-1")
+        let b = Endpoint.localizations(appId: "app-2")
         XCTAssertNotEqual(a.coalesceKey, b.coalesceKey)
-        XCTAssertEqual(a.coalesceKey, "translations:app-1")
+        XCTAssertEqual(a.coalesceKey, "localizations:app-1")
     }
 
     func test_resolveBuildsAbsoluteURL() {
         let base = URL(string: "https://app8.example.com/sdk/v1")!
-        let url = Endpoint.translations(appId: "ABC123").resolve(against: base)
-        XCTAssertEqual(url.absoluteString, "https://app8.example.com/sdk/v1/apps/ABC123/translations")
+        let url = Endpoint.localizations(appId: "ABC123").resolve(against: base)
+        XCTAssertEqual(url.absoluteString, "https://app8.example.com/sdk/v1/apps/ABC123/localizations")
     }
 
     // MARK: - Headers (Accept-Language removal)

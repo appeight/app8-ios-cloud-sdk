@@ -35,6 +35,10 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         var screensByCacheKey: [String: Data] = [:]
         var datasources: [String: Data] = [:]
         var allScreenIds: [String] = []
+        /// Cached `/localizations` payload. Nil means not fetched yet — once
+        /// populated, repeated calls (e.g. a second `prefetchAll`) hit memory
+        /// instead of re-fetching. Cleared by `resetInMemoryState`.
+        var localizations: Data?
     }
     private let state = OSAllocatedUnfairLock<State>(initialState: .init())
 
@@ -105,6 +109,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 s.screensByCacheKey = [:]
                 s.datasources = [:]
                 s.allScreenIds = []
+                s.localizations = nil
             }
             assetState.withLock { s in
                 s.manifest = nil
@@ -250,21 +255,29 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
 
-    /// Fetches the full all-locales translations payload. The engine decodes
-    /// this as `TranslationStore.Bundle` (`{ defaultLocale, locales }`) and
-    /// hands it to `TranslationStore.load(...)` once at app boot.
+    /// Fetches the full all-locales payload from `/sdk/v1/apps/{appId}/localizations`.
+    /// The engine decodes this as `TranslationStore.Bundle`
+    /// (`{ defaultLocale, locales }`) and hands it to `TranslationStore.load(...)`
+    /// once at app boot. Method name keeps the iOS-internal `Translations`
+    /// vocabulary even though the backend route is `/localizations`.
     ///
-    /// Phase 1: network-only. No disk cache, no host-bundle fallback — those
-    /// land in Phase 2. A network failure throws and the engine logs a
-    /// warning + leaves the store empty (i18n keys render as their key strings).
+    /// In-memory cached after first fetch so repeated calls (e.g. a second
+    /// `prefetchAll`, or a render-time consumer after prefetch) hit memory.
+    /// Cleared by `resetInMemoryState`. Disk cache + host-bundle fallback are
+    /// Phase 2; for now a network failure throws and the engine leaves
+    /// `TranslationStore` empty (i18n keys render as their key strings).
     func getTranslations() async throws -> Data {
+        if let cached = state.withLock({ $0.localizations }) {
+            return cached
+        }
         let identity = await readIdentity()
-        let endpoint = Endpoint.translations(appId: appId)
+        let endpoint = Endpoint.localizations(appId: appId)
         let client = self.client
         let raw = try await coalescer.run(key: endpoint.coalesceKey) {
             let result = try await client.get(endpoint, identity: identity)
             return result.data
         }
+        state.withLock { $0.localizations = raw }
         return raw
     }
 

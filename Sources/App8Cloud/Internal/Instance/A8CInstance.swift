@@ -597,6 +597,15 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             let componentsStarted = Date()
             _ = try await dataSource.getComponents()
             log.info("Prefetch: getComponents \(Int(Date().timeIntervalSince(componentsStarted) * 1000))ms")
+
+            // Localizations are fetched once per app launch and the engine
+            // selects which locale to render against client-side via
+            // TranslationStore + instance.setLocale(...). Warming here means
+            // the first screen render doesn't pay an extra round-trip for
+            // localized text resolution.
+            let localizationsStarted = Date()
+            _ = try await dataSource.getTranslations()
+            log.info("Prefetch: getTranslations \(Int(Date().timeIntervalSince(localizationsStarted) * 1000))ms")
         } catch {
             log.warning("Prefetch: app-level warm failed: \(error)")
         }

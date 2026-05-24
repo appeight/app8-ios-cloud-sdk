@@ -61,6 +61,7 @@ final class PrefetchTests: XCTestCase {
     """#
     private static let stylesResponse = #"{"items":[]}"#
     private static let componentsResponse = #"{"items":[]}"#
+    private static let localizationsResponse = #"{"defaultLocale":"en","locales":{}}"#
     private static let screenResponse = #"""
     { "servedVersion": "v3", "data": { "id": "home", "type": "view" } }
     """#
@@ -71,10 +72,11 @@ final class PrefetchTests: XCTestCase {
             let path = req.url!.path
             counter.set(counter.get().merging([path: 1], uniquingKeysWith: +))
             let body: String
-            if path.hasSuffix("/manifest")        { body = Self.manifestResponse }
-            else if path.hasSuffix("/styles")     { body = Self.stylesResponse }
-            else if path.hasSuffix("/components") { body = Self.componentsResponse }
-            else                                  { body = Self.screenResponse }
+            if path.hasSuffix("/manifest")           { body = Self.manifestResponse }
+            else if path.hasSuffix("/styles")        { body = Self.stylesResponse }
+            else if path.hasSuffix("/components")    { body = Self.componentsResponse }
+            else if path.hasSuffix("/localizations") { body = Self.localizationsResponse }
+            else                                     { body = Self.screenResponse }
             return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
                     body.data(using: .utf8)!)
         }
@@ -92,6 +94,8 @@ final class PrefetchTests: XCTestCase {
         XCTAssertEqual(counts["/sdk/v1/apps/test-app/manifest"], 1)
         XCTAssertEqual(counts["/sdk/v1/apps/test-app/styles"], 1)
         XCTAssertEqual(counts["/sdk/v1/apps/test-app/components"], 1)
+        XCTAssertEqual(counts["/sdk/v1/apps/test-app/localizations"], 1,
+            "prefetchAll must warm the localizations bundle so the first screen render doesn't pay an extra round-trip")
         XCTAssertEqual(counts["/sdk/v1/apps/test-app/screens/home"], 1)
         XCTAssertEqual(counts["/sdk/v1/apps/test-app/screens/settings"], 1)
     }
@@ -102,10 +106,11 @@ final class PrefetchTests: XCTestCase {
             counter.set(counter.get() + 1)
             let path = req.url!.path
             let body: String
-            if path.hasSuffix("/manifest")        { body = Self.manifestResponse }
-            else if path.hasSuffix("/styles")     { body = Self.stylesResponse }
-            else if path.hasSuffix("/components") { body = Self.componentsResponse }
-            else                                  { body = Self.screenResponse }
+            if path.hasSuffix("/manifest")           { body = Self.manifestResponse }
+            else if path.hasSuffix("/styles")        { body = Self.stylesResponse }
+            else if path.hasSuffix("/components")    { body = Self.componentsResponse }
+            else if path.hasSuffix("/localizations") { body = Self.localizationsResponse }
+            else                                     { body = Self.screenResponse }
             return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
                     body.data(using: .utf8)!)
         }
@@ -179,10 +184,11 @@ final class PrefetchTests: XCTestCase {
                         Data())
             }
             let body: String
-            if path.hasSuffix("/manifest")        { body = Self.manifestResponse }
-            else if path.hasSuffix("/styles")     { body = Self.stylesResponse }
-            else if path.hasSuffix("/components") { body = Self.componentsResponse }
-            else                                  { body = Self.screenResponse }
+            if path.hasSuffix("/manifest")           { body = Self.manifestResponse }
+            else if path.hasSuffix("/styles")        { body = Self.stylesResponse }
+            else if path.hasSuffix("/components")    { body = Self.componentsResponse }
+            else if path.hasSuffix("/localizations") { body = Self.localizationsResponse }
+            else                                     { body = Self.screenResponse }
             return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
                     body.data(using: .utf8)!)
         }
