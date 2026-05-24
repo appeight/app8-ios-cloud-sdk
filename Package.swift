@@ -8,11 +8,9 @@ let package = Package(
         .library(name: "App8Cloud", targets: ["App8Cloud"]),
     ],
     dependencies: [
-        
         // The rendering engine lives in its own public repo. Pinned `exact`
         // while pre-1.0 — `from:` on a 0.x version allows the whole 0.x range.
-        .package(path: "../app8-ios-sdk"),
-        // .package(url: "https://github.com/appeight/app8-ios-sdk.git", exact: "0.2.0"),
+        .package(url: "https://github.com/appeight/app8-ios-sdk.git", exact: "0.2.2"),
     ],
     targets: [
         .target(

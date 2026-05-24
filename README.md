@@ -9,6 +9,9 @@ dynamic UI from the App8 API:
 - Token-based auth (`app8_live_…` / `app8_test_…`).
 - An on-disk cache scoped per `(appId, screenId, version)`.
 - Native fallback closures for resilience when a render fails.
+- Host observability — subscribe to DSL `.emit` action events, observe
+  analytics events (auto-fired and author-declared), and override the
+  active translation locale.
 - Render telemetry callbacks.
 
 If you need full control over how DSL is fetched (custom API, offline-only),
@@ -29,7 +32,7 @@ use App8Engine directly with your own `App8DataSource`.
 Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/appeight/app8-ios-cloud-sdk.git", from: "0.1.0"),
+.package(url: "https://github.com/appeight/app8-ios-cloud-sdk.git", from: "0.2.2"),
 ```
 
 Then add `App8Cloud` to your target's dependencies.
@@ -123,6 +126,75 @@ DSL screens signal the host app rather than calling native code directly: a
 control fires a URL and your app handles it, deep-link style. The `App8SDKDemo`
 sample shows a host catching DSL-fired `openURL` events and pushing a native
 screen in response.
+
+## Events & analytics
+
+`App8Cloud.Instance` exposes the engine's two in-process buses directly so
+your host can react to what users do inside DSL screens and route analytics
+to your own tracker (Mixpanel, Amplitude, Segment, …).
+
+### Action events (DSL `.emit`)
+
+DSL authors can fire named events from any component via the `.emit` action
+(e.g. `connect.tapped`, `creator.selected`). Subscribe by name, by screen,
+or to everything:
+
+```swift
+let sub = cloud.subscribe(to: "connect.tapped") { event in
+    MyAnalytics.track("connect_tapped", properties: event.payload)
+}
+// Hold `sub` for as long as you want events; let it deallocate to unsubscribe.
+```
+
+Combine and `AsyncStream` variants are available as `cloud.events` and
+`cloud.eventStream`. To register a single handler delegate-style, use
+`cloud.setEventHandler(_:)` (the handler is held weakly).
+
+### Analytics events
+
+The engine auto-fires `app8_*` lifecycle events — `app8_screen_appeared`,
+`app8_screen_dismissed`, `app8_component_tapped`, `app8_navigation_pushed`,
+`app8_url_opened`. The cloud SDK adds `app8_render_failed` and
+`app8_render_fallback` to the same bus. Author-declared analytics events
+(set via an `analytics` JSON binding in the DSL) flow on the same bus.
+
+The canonical pattern is one handler that proxies every event to your real
+tracker:
+
+```swift
+final class App8ToMixpanel: App8AnalyticsHandler {
+    func app8DidTrack(_ event: App8AnalyticsEvent) {
+        Mixpanel.mainInstance().track(
+            event: event.name,
+            properties: event.properties
+        )
+    }
+}
+cloud.setAnalyticsHandler(App8ToMixpanel())  // held weakly
+```
+
+`cloud.observeAnalytics(_:)`, `cloud.analytics` (Combine), and
+`cloud.analyticsStream` (`AsyncStream`) are also available.
+
+Tune which auto-events fire by mutating `cloud.analyticsConfig` —
+`autoScreenEvents`, `autoComponentTaps`, `autoNavigationEvents`,
+`autoUrlEvents` (all default `true`). The cloud SDK's render-lifecycle
+emissions are gated by `autoScreenEvents`.
+
+> **Privacy note.** Both buses are entirely in-process. Nothing on these
+> buses is transmitted to App8's servers — that path is the separate,
+> opt-out remote telemetry (`telemetry: .disabled`).
+
+### Locale override
+
+The engine uses the device locale for `{"$i18n": …}` lookups and
+locale-aware formatters by default. Override it:
+
+```swift
+cloud.setLocale("fr-FR")     // force French
+print(cloud.currentLocale)    // "fr-FR"
+cloud.setLocale(nil)          // revert to device default
+```
 
 ## Privacy & App Store
 
