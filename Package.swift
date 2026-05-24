@@ -10,7 +10,7 @@ let package = Package(
     dependencies: [
         // The rendering engine lives in its own public repo. Pinned `exact`
         // while pre-1.0 — `from:` on a 0.x version allows the whole 0.x range.
-        .package(url: "https://github.com/appeight/app8-ios-sdk.git", exact: "0.2.2"),
+        .package(url: "https://github.com/appeight/app8-ios-sdk.git", exact: "0.2.3"),
     ],
     targets: [
         .target(
