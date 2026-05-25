@@ -136,7 +136,7 @@ to your own tracker (Mixpanel, Amplitude, Segment, …).
 ### Action events (DSL `.emit`)
 
 DSL authors can fire named events from any component via the `.emit` action
-(e.g. `connect.tapped`, `creator.selected`). Subscribe by name, by screen,
+(e.g. `connect.tapped`, `user.selected`). Subscribe by name, by screen,
 or to everything:
 
 ```swift
