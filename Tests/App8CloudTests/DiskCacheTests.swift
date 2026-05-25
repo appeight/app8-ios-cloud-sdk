@@ -114,6 +114,52 @@ final class DiskCacheTests: XCTestCase {
         XCTAssertNil(cache.readScreen(screenId: "home", version: "v1"), "v1 should be pruned")
     }
 
+    func testScreenMetaRoundTrip() {
+        let cache = makeCache()
+        let meta = ScreenMeta(
+            servedVersion: "v3",
+            requestedVersion: nil,
+            updatedAt: "2026-05-24T10:00:00Z",
+            contentHash: "abc123"
+        )
+        XCTAssertTrue(cache.writeScreenMeta(meta, screenId: "home"))
+        let read = cache.readScreenMeta(screenId: "home")
+        XCTAssertEqual(read?.servedVersion, "v3")
+        XCTAssertEqual(read?.updatedAt, "2026-05-24T10:00:00Z")
+        XCTAssertEqual(read?.contentHash, "abc123")
+    }
+
+    func testAppResourceMetaPreservedAcrossTouch() {
+        let cache = makeCache()
+        cache.touchMeta()
+        cache.updateAppResourceMeta(
+            key: "manifest",
+            meta: ResourceMeta(updatedAt: "2026-05-24T09:00:00Z",
+                               contentHash: "h1",
+                               fetchedAt: Date())
+        )
+        // touchMeta must NOT clobber `appResources`.
+        cache.touchMeta()
+        XCTAssertEqual(cache.readAppResourceMeta(key: "manifest")?.contentHash, "h1")
+    }
+
+    func testScreenMetaSurvivesVersionPruning() {
+        let cache = makeCache(versionsToKeep: 1)
+        let meta = ScreenMeta(
+            servedVersion: "v1",
+            requestedVersion: nil,
+            updatedAt: "2026-05-24T10:00:00Z",
+            contentHash: "h"
+        )
+        cache.writeScreenMeta(meta, screenId: "home")
+        for v in ["v1", "v2", "v3"] {
+            cache.writeScreen(screenId: "home", version: v, data: Data(v.utf8))
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTAssertNotNil(cache.readScreenMeta(screenId: "home"),
+                        "_meta.json must survive pruning")
+    }
+
     func testSchemaMismatchInvalidatesCache() {
         let cache = makeCache()
         cache.writeManifest(Data("X".utf8))
@@ -125,5 +171,65 @@ final class DiskCacheTests: XCTestCase {
         try? badMeta.write(to: cache.layout.metaFile)
 
         XCTAssertFalse(cache.hasUsableAppCache())
+    }
+
+    // MARK: - Fix #14 — schema-mismatch wipe at init
+
+    func testDiskCacheInitWipesStaleSchema() throws {
+        let layout = CacheLayout(cacheRoot: tempRoot, appId: "test-app")
+        // Pre-seed the cache with a v999 meta and assorted files. A fresh
+        // DiskCache should wipe the whole root before returning.
+        try FileManager.default.createDirectory(at: layout.rootForApp, withIntermediateDirectories: true)
+        let badMeta = #"""
+        {"schemaVersion":"v999","sdkVersion":"0.0.0","fetchedAt":"2026-01-01T00:00:00Z"}
+        """#.data(using: .utf8)!
+        try badMeta.write(to: layout.metaFile)
+        try Data("legacy".utf8).write(to: layout.manifestFile)
+
+        _ = DiskCache(layout: layout, versionsToKeep: 2, diagnostics: .disabled)
+
+        XCTAssertNil(try? Data(contentsOf: layout.manifestFile),
+                     "manifest from stale-schema cache must be wiped at init")
+        XCTAssertNil(MetaStore.readApp(at: layout.metaFile),
+                     "meta.json from stale-schema cache must be wiped at init")
+    }
+
+    func testDiskCacheInitPreservesMatchingSchema() throws {
+        let layout = CacheLayout(cacheRoot: tempRoot, appId: "test-app")
+        let cache1 = DiskCache(layout: layout, versionsToKeep: 2, diagnostics: .disabled)
+        cache1.writeManifest(Data("X".utf8))
+        cache1.touchMeta()
+
+        // Re-init with the same schema version — must not wipe.
+        let cache2 = DiskCache(layout: layout, versionsToKeep: 2, diagnostics: .disabled)
+        XCTAssertEqual(cache2.readManifest(), Data("X".utf8),
+                       "matching-schema cache must survive a fresh DiskCache init")
+    }
+
+    // MARK: - Fix #7 — concurrent meta-update serialization
+
+    func testConcurrentAppResourceMetaUpdatesDontDropEntries() async {
+        let cache = makeCache()
+        cache.touchMeta()
+
+        // Fire many concurrent updates of distinct keys. Without internal
+        // serialization, last-writer-wins can drop earlier entries.
+        await withTaskGroup(of: Void.self) { group in
+            for i in 0..<50 {
+                group.addTask {
+                    cache.updateAppResourceMeta(
+                        key: "k\(i)",
+                        meta: ResourceMeta(updatedAt: "T\(i)",
+                                           contentHash: "h\(i)",
+                                           fetchedAt: Date())
+                    )
+                }
+            }
+        }
+
+        for i in 0..<50 {
+            XCTAssertNotNil(cache.readAppResourceMeta(key: "k\(i)"),
+                            "k\(i) lost — concurrent updates must serialize")
+        }
     }
 }

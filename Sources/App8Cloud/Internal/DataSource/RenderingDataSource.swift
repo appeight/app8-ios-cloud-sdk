@@ -204,7 +204,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             log.debug("[Asset] hit key='\(key)' (id=\(assetId ?? "nil") name=\(assetName ?? "nil"))")
             return blob
         }
-        log.info("[Asset] MISS key='\(key)' (id=\(assetId ?? "nil") name=\(assetName ?? "nil")) — fetching")
+        log.debug("[Asset] MISS key='\(key)' (id=\(assetId ?? "nil") name=\(assetName ?? "nil")) — fetching")
         let started = Date()
         let manifest = try await ensureAssetManifest()
         guard let entry = manifest.resolve(id: assetId, name: assetName),
@@ -234,7 +234,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             assetCache?.write(key: entryId, data: data)
         }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
-        log.info("[Asset] fetched key='\(key)' (\(data.count) bytes) in \(ms)ms")
+        log.debug("[Asset] fetched key='\(key)' (\(data.count) bytes) in \(ms)ms")
         return data
     }
 
@@ -250,11 +250,16 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
 
-    /// Full all-locales payload for `TranslationStore`. In-memory cached
-    /// (cleared by `resetInMemoryState`). Disk + host-bundle fallback: Phase 2.
+    /// Full all-locales payload for `TranslationStore`.
     func getTranslations() async throws -> Data {
         if let cached = state.withLock({ $0.localizations }) {
             return cached
+        }
+        if let cache, cache.hasUsableAppCache(),
+           let disk = cache.readLocalizations()
+        {
+            state.withLock { $0.localizations = disk }
+            return disk
         }
         let identity = await readIdentity()
         let endpoint = Endpoint.localizations(appId: appId)
@@ -264,21 +269,153 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             return result.data
         }
         state.withLock { $0.localizations = raw }
+        if let cache {
+            cache.writeLocalizations(raw)
+            // Seed meta so the next prefetch can hash-compare instead of
+            // re-fetching this as .noPriorCache.
+            let existingUpdatedAt = cache.readAppResourceMeta(key: "localizations")?.updatedAt
+            cache.updateAppResourceMeta(key: "localizations", meta: ResourceMeta(
+                updatedAt: existingUpdatedAt,
+                contentHash: ContentHash.sha256Hex(raw),
+                fetchedAt: Date()
+            ))
+        }
         return raw
     }
 
     // MARK: - Prefetch (no engine render — just cache warming)
 
-    func prefetchScreen(id: String, version: String?) async throws {
+    enum PrefetchOutcome: Sendable, Equatable, CustomStringConvertible {
+        case cachedFresh
+        case unchanged
+        case refreshed(reason: InvalidationReason)
+
+        var description: String {
+            switch self {
+            case .cachedFresh:           return "cached"
+            case .unchanged:             return "unchanged"
+            case .refreshed(let reason): return "refreshed(\(reason.rawValue))"
+            }
+        }
+    }
+
+    enum InvalidationReason: String, Sendable {
+        case versionChanged    = "version_changed"
+        case updatedAtChanged  = "updated_at_changed"
+        case contentChanged    = "content_changed"
+        case noPriorCache      = "no_prior_cache"
+    }
+
+    func prefetchScreen(
+        id: String,
+        version: String?,
+        expected: ScreenFreshness? = nil
+    ) async throws -> PrefetchOutcome {
         let key = cacheKey(screenId: id, version: version)
-        if state.withLock({ $0.screensByCacheKey[key] }) != nil {
-            return
+        let stored = cache?.readScreenMeta(screenId: id)
+        let storedBlob = cache?.readScreen(screenId: id, version: version)
+
+        if let expected, let stored, let storedBlob,
+           freshnessMatches(stored: stored, expected: expected)
+        {
+            state.withLock { $0.screensByCacheKey[key] = storedBlob }
+            return .cachedFresh
         }
-        if let blob = cache?.readScreen(screenId: id, version: version) {
-            state.withLock { $0.screensByCacheKey[key] = blob }
-            return
+
+        // No-signal fallback: trust the cache when the backend doesn't
+        // ship updatedAt, mirroring pre-feature warm-once semantics.
+        if expected?.updatedAt == nil,
+           let storedBlob,
+           (expected?.version == nil || stored?.servedVersion == expected?.version)
+        {
+            state.withLock { $0.screensByCacheKey[key] = storedBlob }
+            return .cachedFresh
         }
-        _ = try await fetchScreen(screenId: id, version: version)
+
+        // Wipe BEFORE fetching so a fetch failure leaves the screen uncached.
+        let preCheckReason: InvalidationReason? = {
+            if let expected, let stored {
+                return mismatchReason(stored: stored, expected: expected)
+            }
+            if stored == nil { return .noPriorCache }
+            return nil
+        }()
+        if let reason = preCheckReason, reason != .noPriorCache {
+            cache?.clearScreen(id: id)
+            state.withLock {
+                $0.screensByCacheKey = $0.screensByCacheKey.filter { !$0.key.hasPrefix("\(id)@") }
+            }
+        }
+
+        let response = try await fetchScreenResponse(screenId: id, version: version)
+        let newHash = ContentHash.sha256Hex(response.data)
+        // Skip the write only when the blob exists AND its hash matches.
+        let canTrustStoredBlob = (preCheckReason == nil) && (storedBlob != nil)
+        let priorHash = canTrustStoredBlob ? stored?.contentHash : nil
+        let bytesChanged = (priorHash != newHash)
+
+        applyScreenResponse(
+            response,
+            screenId: id,
+            requestedVersion: version,
+            expected: expected,
+            existingMeta: stored,
+            contentHash: newHash,
+            skipDiskWrite: !bytesChanged
+        )
+        await reportServed(version: response.servedVersion, fromCache: false, screenId: id)
+
+        if !bytesChanged {
+            return .unchanged
+        }
+        return .refreshed(reason: preCheckReason ?? .contentChanged)
+    }
+
+    /// Matches only when `updatedAt` is present on both sides — without it
+    /// we can't rule out an in-place change without fetching.
+    private func freshnessMatches(stored: ScreenMeta, expected: ScreenFreshness) -> Bool {
+        guard let expectedUpdated = expected.updatedAt,
+              let storedUpdated = stored.updatedAt,
+              expectedUpdated == storedUpdated
+        else {
+            return false
+        }
+        if let expectedVersion = expected.version,
+           expectedVersion != stored.servedVersion
+        {
+            return false
+        }
+        return true
+    }
+
+    private func hydrateComponentsFromDiskIfCold(precomputed: [Data]? = nil) {
+        guard state.withLock({ !$0.componentsLoaded }) else { return }
+        let blobs = precomputed ?? cache?.readAllComponents() ?? []
+        guard !blobs.isEmpty else { return }
+        let byDslId: [String: Data] = blobs.reduce(into: [:]) { acc, blob in
+            if let id = extractDslId(from: blob) { acc[id] = blob }
+        }
+        state.withLock { s in
+            s.components = blobs
+            s.componentsByDslId = byDslId
+            s.componentsLoaded = true
+        }
+    }
+
+    private func mismatchReason(stored: ScreenMeta, expected: ScreenFreshness) -> InvalidationReason? {
+        if let expectedVersion = expected.version,
+           let storedVersion = stored.servedVersion,
+           expectedVersion != storedVersion
+        {
+            return .versionChanged
+        }
+        if let expectedUpdated = expected.updatedAt,
+           let storedUpdated = stored.updatedAt,
+           expectedUpdated != storedUpdated
+        {
+            return .updatedAtChanged
+        }
+        return nil
     }
 
     /// Prefetch images + fonts the screen references, skipping ones already cached/registered.
@@ -295,7 +432,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             log.warning("prefetchScreenImages: collectAssetReferences failed for \(id): \(error)")
             return
         }
-        log.info("[Prefetch] screen='\(id)' refs: images=\(refs.images.count) fonts=\(refs.fonts.count)")
+        log.debug("[Prefetch] screen='\(id)' refs: images=\(refs.images.count) fonts=\(refs.fonts.count)")
         // Two image-prefetch paths:
         //   1. Manifest-resolvable (id/name) — goes through `getAsset`, lands in
         //      our disk-backed AssetCache; engine looks it up at render time.
@@ -326,21 +463,21 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         let fontsToFetch: [App8.FontReference] = refs.fonts.filter { ref in
             UIFont(name: ref.postScriptName, size: 1) == nil
         }
-        // Log so render-time misses can be correlated to skipped prefetch entries.
+        // Debug-level so render-time misses can be correlated to skipped prefetch entries.
         if !manifestImagesToFetch.isEmpty {
             let keys = manifestImagesToFetch.map { ($0.id ?? $0.name) ?? "?" }
-            log.info("[Prefetch] screen='\(id)' will fetch \(manifestImagesToFetch.count) image(s): \(keys)")
+            log.debug("[Prefetch] screen='\(id)' will fetch \(manifestImagesToFetch.count) image(s): \(keys)")
         }
         if !rawUrlsToFetch.isEmpty {
-            log.info("[Prefetch] screen='\(id)' will warm \(rawUrlsToFetch.count) raw URL(s): \(rawUrlsToFetch)")
+            log.debug("[Prefetch] screen='\(id)' will warm \(rawUrlsToFetch.count) raw URL(s): \(rawUrlsToFetch)")
         }
         if !fontsToFetch.isEmpty {
             let names = fontsToFetch.map(\.postScriptName)
-            log.info("[Prefetch] screen='\(id)' will register \(fontsToFetch.count) font(s): \(names)")
+            log.debug("[Prefetch] screen='\(id)' will register \(fontsToFetch.count) font(s): \(names)")
         }
 
         if manifestImagesToFetch.isEmpty && rawUrlsToFetch.isEmpty && fontsToFetch.isEmpty {
-            log.info("[Prefetch] screen='\(id)' — nothing to fetch (\(refs.images.count) images, \(refs.fonts.count) fonts already warm).")
+            log.debug("[Prefetch] screen='\(id)' — nothing to fetch (\(refs.images.count) images, \(refs.fonts.count) fonts already warm).")
             return
         }
 
@@ -382,8 +519,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             for await _ in group { enqueueNext() }
         }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
-        let skippedImages = refs.images.count - manifestImagesToFetch.count - rawUrlsToFetch.count
-        log.info("prefetchScreenImages: screen=\(id) — warmed \(manifestImagesToFetch.count) manifest image(s) + \(rawUrlsToFetch.count) raw URL(s) + \(fontsToFetch.count) font(s) in \(ms)ms (skipped \(skippedImages) cached images, \(refs.fonts.count - fontsToFetch.count) registered fonts).")
+        log.debug("prefetchScreenImages: screen=\(id) — warmed \(manifestImagesToFetch.count) image(s) + \(rawUrlsToFetch.count) raw URL(s) + \(fontsToFetch.count) font(s) in \(ms)ms.")
     }
 
     /// Warm `URLCache.shared` so the engine's `ImageLoader` (built from
@@ -443,7 +579,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             for await _ in group { enqueueNext() }
         }
         let ms = Int(Date().timeIntervalSince(started) * 1000)
-        log.info("ensureScreenFontsRegistered: screen=\(id) — registered \(fontsToFetch.count) font(s) in \(ms)ms.")
+        log.debug("ensureScreenFontsRegistered: screen=\(id) — registered \(fontsToFetch.count) font(s) in \(ms)ms.")
     }
 
     /// Engine asset hint preferred; falls back to PostScript-name → filename match.
@@ -521,7 +657,25 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         "\(screenId)@\(version ?? CacheLayout.latestVersionSentinel)"
     }
 
+    /// Render-time fetch on cache miss.
     private func fetchScreen(screenId: String, version: String?) async throws -> Data {
+        let priorMeta = cache?.readScreenMeta(screenId: screenId)
+        let response = try await fetchScreenResponse(screenId: screenId, version: version)
+        let hash = ContentHash.sha256Hex(response.data)
+        applyScreenResponse(
+            response,
+            screenId: screenId,
+            requestedVersion: version,
+            expected: nil,
+            existingMeta: priorMeta,
+            contentHash: hash,
+            skipDiskWrite: false
+        )
+        await reportServed(version: response.servedVersion, fromCache: false, screenId: screenId)
+        return response.data
+    }
+
+    private func fetchScreenResponse(screenId: String, version: String?) async throws -> ScreenRenderResponse {
         let identity = await readIdentity()
         let endpoint = Endpoint.screen(appId: appId, screenId: screenId, version: version)
         let client = self.client
@@ -529,21 +683,21 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             let result = try await client.get(endpoint, identity: identity)
             return result.data
         }
-        let response: ScreenRenderResponse
         do {
-            response = try JSONDecoder().decode(ScreenRenderResponse.self, from: raw)
+            return try JSONDecoder().decode(ScreenRenderResponse.self, from: raw)
         } catch {
             throw App8Cloud.Error.decodeFailed(context: "ScreenRenderResponse", underlying: error)
         }
-        applyScreenResponse(response, screenId: screenId, requestedVersion: version)
-        await reportServed(version: response.servedVersion, fromCache: false, screenId: screenId)
-        return response.data
     }
 
     private func applyScreenResponse(
         _ response: ScreenRenderResponse,
         screenId: String,
-        requestedVersion: String?
+        requestedVersion: String?,
+        expected: ScreenFreshness?,
+        existingMeta: ScreenMeta? = nil,
+        contentHash: String,
+        skipDiskWrite: Bool
     ) {
         let body = response.data
         let key = cacheKey(screenId: screenId, version: requestedVersion)
@@ -592,10 +746,289 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 for (path, blob) in dss { s.datasources[path] = blob }
             }
         }
-        cache?.writeScreen(screenId: screenId, version: requestedVersion, data: body)
-        // Persist under served-version too — future explicit pin hits cache.
-        if let served = response.servedVersion, served != (requestedVersion ?? "") {
+        if !skipDiskWrite {
+            cache?.writeScreen(screenId: screenId, version: requestedVersion, data: body)
+        }
+        // Served-version alias for future explicit-pin reads. Rewritten if
+        // pruning removed it on a prior session, even on skipDiskWrite.
+        if let served = response.servedVersion,
+           served != (requestedVersion ?? ""),
+           cache?.readScreen(screenId: screenId, version: served) == nil
+        {
             cache?.writeScreen(screenId: screenId, version: served, data: body)
+        }
+        // Render-time `fetchScreen` passes `expected: nil`; preserving the
+        // prior `updatedAt` keeps the next prefetch's cheap-precheck working.
+        let resolvedUpdatedAt = expected?.updatedAt ?? existingMeta?.updatedAt
+        let meta = ScreenMeta(
+            servedVersion: response.servedVersion,
+            requestedVersion: requestedVersion,
+            updatedAt: resolvedUpdatedAt,
+            contentHash: contentHash
+        )
+        cache?.writeScreenMeta(meta, screenId: screenId)
+    }
+
+    // MARK: - Prefetch freshness checks for app-level resources
+
+    /// Prefetch-only. Render-time path still uses `loadManifestIfNeeded`.
+    func refreshManifestIfChanged(expectedUpdatedAt: String?) async throws -> PrefetchOutcome {
+        let stored = cache?.readAppResourceMeta(key: "manifest")
+        if let expectedUpdatedAt,
+           let stored,
+           stored.updatedAt == expectedUpdatedAt,
+           cache?.readManifest() != nil
+        {
+            hydrateManifestFromDiskIfCold()
+            return .cachedFresh
+        }
+        // No-signal fallback: trust the cache, capped by the max-age TTL
+        // so silent backend updates surface within a day.
+        if expectedUpdatedAt == nil,
+           cache?.readManifest() != nil,
+           isWithinNoSignalMaxAge(stored?.fetchedAt)
+        {
+            hydrateManifestFromDiskIfCold()
+            return .cachedFresh
+        }
+
+        let identity = await readIdentity()
+        let endpoint = Endpoint.manifest(appId: appId)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        let response: AppManifestResponse
+        do {
+            response = try JSONDecoder().decode(AppManifestResponse.self, from: raw)
+        } catch {
+            throw App8Cloud.Error.decodeFailed(context: "AppManifestResponse", underlying: error)
+        }
+        let newHash = ContentHash.sha256Hex(response.configuration)
+        let priorHash = stored?.contentHash
+        let bytesChanged = (priorHash != newHash)
+
+        if bytesChanged {
+            state.withLock { $0.manifest = response.configuration }
+            cache?.writeManifest(response.configuration)
+        } else {
+            state.withLock { s in
+                if s.manifest == nil { s.manifest = response.configuration }
+            }
+        }
+        cache?.updateAppResourceMeta(key: "manifest", meta: ResourceMeta(
+            updatedAt: expectedUpdatedAt ?? stored?.updatedAt,
+            contentHash: newHash,
+            fetchedAt: Date()
+        ))
+
+        if !bytesChanged { return .unchanged }
+        return .refreshed(reason: priorHash == nil ? .noPriorCache : .contentChanged)
+    }
+
+    /// Cap on the no-signal cache-trust window — daily re-check catches
+    /// silent backend updates against pre-feature backends.
+    private static let noSignalMaxAge: TimeInterval = 24 * 60 * 60
+
+    /// `nil` ⇒ legacy meta without `fetchedAt`; one-shot pass while it gets rewritten.
+    private func isWithinNoSignalMaxAge(_ fetchedAt: Date?) -> Bool {
+        guard let fetchedAt else { return true }
+        return Date().timeIntervalSince(fetchedAt) < Self.noSignalMaxAge
+    }
+
+    private func hydrateManifestFromDiskIfCold() {
+        guard let cache, let blob = cache.readManifest() else { return }
+        state.withLock { s in
+            if s.manifest == nil { s.manifest = blob }
+        }
+    }
+
+    func refreshStylesIfChanged(expectedUpdatedAt: String?) async throws -> PrefetchOutcome {
+        let stored = cache?.readAppResourceMeta(key: "styles")
+        if let expectedUpdatedAt,
+           let stored,
+           stored.updatedAt == expectedUpdatedAt,
+           cache?.readStylesBlob() != nil
+        {
+            hydrateStylesFromDiskIfCold()
+            return .cachedFresh
+        }
+        if expectedUpdatedAt == nil,
+           cache?.readStylesBlob() != nil,
+           isWithinNoSignalMaxAge(stored?.fetchedAt)
+        {
+            hydrateStylesFromDiskIfCold()
+            return .cachedFresh
+        }
+
+        let identity = await readIdentity()
+        let endpoint = Endpoint.styles(appId: appId)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        let styles: StyleArrayResponse
+        do {
+            styles = try JSONDecoder().decode(StyleArrayResponse.self, from: raw)
+        } catch {
+            throw App8Cloud.Error.decodeFailed(context: "StyleArrayResponse", underlying: error)
+        }
+        let newHash = ContentHash.sha256Hex(raw)
+        let priorHash = stored?.contentHash
+        let bytesChanged = (priorHash != newHash)
+
+        if bytesChanged {
+            state.withLock { s in
+                s.styles = styles.items
+                s.stylesLoaded = true
+            }
+            cache?.writeStyles(styles.items)
+        } else {
+            state.withLock { s in
+                if !s.stylesLoaded {
+                    s.styles = styles.items
+                    s.stylesLoaded = true
+                }
+            }
+        }
+        cache?.updateAppResourceMeta(key: "styles", meta: ResourceMeta(
+            updatedAt: expectedUpdatedAt ?? stored?.updatedAt,
+            contentHash: newHash,
+            fetchedAt: Date()
+        ))
+
+        if !bytesChanged { return .unchanged }
+        return .refreshed(reason: priorHash == nil ? .noPriorCache : .contentChanged)
+    }
+
+    private func hydrateStylesFromDiskIfCold() {
+        guard let cache, cache.readStylesBlob() != nil else { return }
+        state.withLock { s in
+            guard !s.stylesLoaded else { return }
+            s.styles = cache.readStyles()
+            s.stylesLoaded = true
+        }
+    }
+
+    func refreshComponentsIfChanged(expectedUpdatedAt: String?) async throws -> PrefetchOutcome {
+        let stored = cache?.readAppResourceMeta(key: "components")
+        if let expectedUpdatedAt,
+           let stored,
+           stored.updatedAt == expectedUpdatedAt,
+           let blobs = cache?.readAllComponents(), !blobs.isEmpty
+        {
+            hydrateComponentsFromDiskIfCold(precomputed: blobs)
+            return .cachedFresh
+        }
+        if expectedUpdatedAt == nil,
+           let blobs = cache?.readAllComponents(), !blobs.isEmpty,
+           isWithinNoSignalMaxAge(stored?.fetchedAt)
+        {
+            hydrateComponentsFromDiskIfCold(precomputed: blobs)
+            return .cachedFresh
+        }
+
+        let identity = await readIdentity()
+        let endpoint = Endpoint.components(appId: appId)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        let components: ComponentArrayResponse
+        do {
+            components = try JSONDecoder().decode(ComponentArrayResponse.self, from: raw)
+        } catch {
+            throw App8Cloud.Error.decodeFailed(context: "ComponentArrayResponse", underlying: error)
+        }
+        let newHash = ContentHash.sha256Hex(raw)
+        let priorHash = stored?.contentHash
+        let bytesChanged = (priorHash != newHash)
+
+        let byDslId: [String: Data] = components.items.reduce(into: [:]) { acc, blob in
+            if let id = extractDslId(from: blob) {
+                acc[id] = blob
+            }
+        }
+        if bytesChanged {
+            state.withLock { s in
+                s.components = components.items
+                s.componentsByDslId = byDslId
+                s.componentsLoaded = true
+            }
+            cache?.writeComponents(components.items, idResolver: extractDslId)
+        } else {
+            state.withLock { s in
+                if !s.componentsLoaded {
+                    s.components = components.items
+                    s.componentsByDslId = byDslId
+                    s.componentsLoaded = true
+                }
+            }
+        }
+        cache?.updateAppResourceMeta(key: "components", meta: ResourceMeta(
+            updatedAt: expectedUpdatedAt ?? stored?.updatedAt,
+            contentHash: newHash,
+            fetchedAt: Date()
+        ))
+
+        if !bytesChanged { return .unchanged }
+        return .refreshed(reason: priorHash == nil ? .noPriorCache : .contentChanged)
+    }
+
+    func refreshLocalizationsIfChanged(expectedUpdatedAt: String?) async throws -> PrefetchOutcome {
+        let stored = cache?.readAppResourceMeta(key: "localizations")
+        if let expectedUpdatedAt,
+           let stored,
+           stored.updatedAt == expectedUpdatedAt,
+           cache?.readLocalizations() != nil
+        {
+            hydrateLocalizationsFromDiskIfCold()
+            return .cachedFresh
+        }
+        if expectedUpdatedAt == nil,
+           cache?.readLocalizations() != nil,
+           isWithinNoSignalMaxAge(stored?.fetchedAt)
+        {
+            hydrateLocalizationsFromDiskIfCold()
+            return .cachedFresh
+        }
+
+        let identity = await readIdentity()
+        let endpoint = Endpoint.localizations(appId: appId)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        let newHash = ContentHash.sha256Hex(raw)
+        let priorHash = stored?.contentHash
+        let bytesChanged = (priorHash != newHash)
+
+        if bytesChanged {
+            state.withLock { $0.localizations = raw }
+            cache?.writeLocalizations(raw)
+        } else {
+            state.withLock { s in
+                if s.localizations == nil { s.localizations = raw }
+            }
+        }
+        cache?.updateAppResourceMeta(key: "localizations", meta: ResourceMeta(
+            updatedAt: expectedUpdatedAt ?? stored?.updatedAt,
+            contentHash: newHash,
+            fetchedAt: Date()
+        ))
+
+        if !bytesChanged { return .unchanged }
+        return .refreshed(reason: priorHash == nil ? .noPriorCache : .contentChanged)
+    }
+
+    private func hydrateLocalizationsFromDiskIfCold() {
+        guard let cache, let disk = cache.readLocalizations() else { return }
+        state.withLock { s in
+            if s.localizations == nil { s.localizations = disk }
         }
     }
 
@@ -660,7 +1093,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             return
         }
         let manifestMs = Int(Date().timeIntervalSince(manifestStarted) * 1000)
-        log.info("prepareFontsIfNeeded: asset manifest cached in \(manifestMs)ms — per-screen font registration is now driven by the engine's collectAssetReferences API.")
+        log.debug("prepareFontsIfNeeded: asset manifest cached in \(manifestMs)ms.")
         // Per-screen prefetch via `prefetchScreenImages` is the only path that
         // downloads + registers fonts now — don't eagerly walk the manifest.
     }
@@ -701,6 +1134,21 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
 
     private func loadComponentsIfNeeded() async throws {
         if state.withLock({ $0.componentsLoaded }) { return }
+        // Disk-first — engine BFS would otherwise trigger /components on every cold start.
+        if let cache, cache.hasUsableAppCache() {
+            let disk = cache.readAllComponents()
+            if !disk.isEmpty {
+                let byDslId: [String: Data] = disk.reduce(into: [:]) { acc, blob in
+                    if let id = extractDslId(from: blob) { acc[id] = blob }
+                }
+                state.withLock { s in
+                    s.components = disk
+                    s.componentsByDslId = byDslId
+                    s.componentsLoaded = true
+                }
+                return
+            }
+        }
         let identity = await readIdentity()
         let endpoint = Endpoint.components(appId: appId)
         let client = self.client
@@ -771,10 +1219,32 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         if let manifest = assetState.withLock({ $0.manifest }), !manifest.isExpired {
             return manifest
         }
+        // Disk hydrate — saves a /assets/manifest round trip on warm starts.
+        if assetState.withLock({ $0.manifest == nil }),
+           let cache,
+           cache.hasUsableAppCache(),
+           let diskBytes = cache.readAssetsManifest(),
+           let persisted = try? jsonDecoder.decode(PersistedAssetsManifest.self, from: diskBytes)
+        {
+            let now = Date()
+            let expiresAt = persisted.fetchedAt.addingTimeInterval(TimeInterval(persisted.expiresIn))
+            // `fetchedAt <= now` guards against wall-clock rollback.
+            if expiresAt > now, persisted.fetchedAt <= now {
+                let entries = Self.entriesFromAssetItems(
+                    persisted.assets.map { ($0.id, $0.filename, $0.mimeType, $0.downloadUrl) },
+                    expiresAt: expiresAt
+                )
+                assetState.withLock { $0.manifest = entries }
+                log.debug("ensureAssetManifest: hydrated from disk (\(persisted.assets.count) asset(s), expires \(expiresAt)).")
+                return entries
+            } else {
+                log.debug("ensureAssetManifest: disk copy expired at \(expiresAt); re-fetching.")
+            }
+        }
         if let prior = assetState.withLock({ $0.manifest }) {
-            log.info("ensureAssetManifest: re-fetching — prior manifest expired at \(prior.expiresAt).")
+            log.debug("ensureAssetManifest: re-fetching — prior manifest expired at \(prior.expiresAt).")
         } else {
-            log.info("ensureAssetManifest: first fetch.")
+            log.debug("ensureAssetManifest: first fetch.")
         }
         let identity = await readIdentity()
         let endpoint = Endpoint.assetsManifest(appId: appId)
@@ -794,26 +1264,74 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         if effectiveExpiresIn != decoded.expiresIn {
             log.warning("ensureAssetManifest: backend expiresIn=\(decoded.expiresIn)s is too low; flooring to \(effectiveExpiresIn)s for in-memory cache.")
         }
-        log.info("ensureAssetManifest: backend returned \(decoded.assets.count) asset(s), expiresIn=\(decoded.expiresIn)s (using \(effectiveExpiresIn)s).")
-        var byId: [String: AssetEntry] = [:]
-        var byFilename: [String: AssetEntry] = [:]
-        for asset in decoded.assets {
-            let entry = AssetEntry(
-                id: asset.id,
-                filename: asset.filename,
-                mimeType: asset.mimeType,
-                downloadUrl: asset.downloadUrl
-            )
-            byId[asset.id] = entry
-            byFilename[asset.filename] = entry
-        }
-        let manifest = AssetManifestEntries(
-            byId: byId,
-            byFilename: byFilename,
-            expiresAt: Date().addingTimeInterval(TimeInterval(effectiveExpiresIn))
+        log.debug("ensureAssetManifest: backend returned \(decoded.assets.count) asset(s), expiresIn=\(decoded.expiresIn)s (using \(effectiveExpiresIn)s).")
+        let now = Date()
+        let manifest = Self.entriesFromAssetItems(
+            decoded.assets.map { ($0.id, $0.filename, $0.mimeType, $0.downloadUrl) },
+            expiresAt: now.addingTimeInterval(TimeInterval(effectiveExpiresIn))
         )
         assetState.withLock { $0.manifest = manifest }
+        // Persist for next launch. Store the effective (floored) expiresIn
+        // so a future read reflects the same policy this session enforced.
+        let persisted = PersistedAssetsManifest(
+            schemaVersion: CacheLayout.schemaVersion,
+            fetchedAt: now,
+            expiresIn: effectiveExpiresIn,
+            assets: decoded.assets.map {
+                PersistedAssetsManifest.AssetItem(
+                    id: $0.id, filename: $0.filename,
+                    mimeType: $0.mimeType, downloadUrl: $0.downloadUrl
+                )
+            }
+        )
+        if let data = try? jsonEncoder.encode(persisted) {
+            cache?.writeAssetsManifest(data)
+        }
         return manifest
+    }
+
+    private static func entriesFromAssetItems(
+        _ items: [(id: String, filename: String, mimeType: String?, downloadUrl: String)],
+        expiresAt: Date
+    ) -> AssetManifestEntries {
+        var byId: [String: AssetEntry] = [:]
+        var byFilename: [String: AssetEntry] = [:]
+        for item in items {
+            let entry = AssetEntry(
+                id: item.id,
+                filename: item.filename,
+                mimeType: item.mimeType,
+                downloadUrl: item.downloadUrl
+            )
+            byId[item.id] = entry
+            byFilename[item.filename] = entry
+        }
+        return AssetManifestEntries(byId: byId, byFilename: byFilename, expiresAt: expiresAt)
+    }
+
+    private struct PersistedAssetsManifest: Codable, Sendable {
+        let schemaVersion: String
+        let fetchedAt: Date
+        let expiresIn: Int
+        let assets: [AssetItem]
+
+        struct AssetItem: Codable, Sendable {
+            let id: String
+            let filename: String
+            let mimeType: String?
+            let downloadUrl: String
+        }
+    }
+
+    private var jsonEncoder: JSONEncoder {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        return e
+    }
+    private var jsonDecoder: JSONDecoder {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
     }
 
     // MARK: - Published-screen discovery
@@ -822,10 +1340,25 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         let screenKey: String
         let version: String
         let minDslVersion: String
+        let updatedAt: String?
+    }
+
+    /// Per-resource `updatedAt` from the `/screens` list. Nil fields mean
+    /// the backend didn't ship that timestamp — fall back to hash-compare.
+    struct AppResourcesSnapshot: Sendable, Equatable {
+        let manifest: String?
+        let styles: String?
+        let components: String?
+        let localizations: String?
+    }
+
+    struct PublishedSnapshot: Sendable {
+        let screens: [PublishedScreen]
+        let resources: AppResourcesSnapshot?
     }
 
     /// nil = backend pre-dates the endpoint (404). Throws on transport/auth/decode failures.
-    func fetchPublishedScreens() async throws -> [PublishedScreen]? {
+    func fetchPublishedScreens() async throws -> PublishedSnapshot? {
         let identity = await readIdentity()
         let endpoint = Endpoint.listScreens(appId: appId)
         let client = self.client
@@ -836,7 +1369,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 return result.data
             }
         } catch App8Cloud.Error.serverError(let status, _) where status == 404 {
-            log.info("[Prefetch] backend has no /apps/{id}/screens endpoint (404) — falling back to flow BFS only.")
+            log.debug("[Prefetch] backend has no /apps/{id}/screens endpoint (404) — falling back to flow BFS only.")
             return nil
         }
         let decoded: ListScreensResponse
@@ -845,22 +1378,45 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         } catch {
             throw App8Cloud.Error.decodeFailed(context: "ListScreensResponse", underlying: error)
         }
-        return decoded.screens.map {
+        let screens = decoded.screens.map {
             PublishedScreen(
                 screenKey: $0.screenKey,
                 version: $0.version,
-                minDslVersion: $0.minDslVersion
+                minDslVersion: $0.minDslVersion,
+                updatedAt: $0.updatedAt
             )
         }
+        let resources = decoded.resources.map {
+            AppResourcesSnapshot(
+                manifest: $0.manifest?.updatedAt,
+                styles: $0.styles?.updatedAt,
+                components: $0.components?.updatedAt,
+                localizations: $0.localizations?.updatedAt
+            )
+        }
+        return PublishedSnapshot(screens: screens, resources: resources)
     }
 
     private struct ListScreensResponse: Decodable {
         let screens: [ScreenItem]
+        let resources: ResourcesBlock?
 
         struct ScreenItem: Decodable {
             let screenKey: String
             let version: String
             let minDslVersion: String
+            let updatedAt: String?
+        }
+
+        struct ResourcesBlock: Decodable {
+            let manifest: Freshness?
+            let styles: Freshness?
+            let components: Freshness?
+            let localizations: Freshness?
+        }
+
+        struct Freshness: Decodable {
+            let updatedAt: String
         }
     }
 

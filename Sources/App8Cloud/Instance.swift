@@ -66,6 +66,9 @@ public extension App8Cloud {
 
         var onFallbackInvoked: ((FallbackEvent) -> Void)? { get set }
 
+        /// Fires after every prefetch with a per-resource freshness summary.
+        var onPrefetchCompleted: ((PrefetchEvent) -> Void)? { get set }
+
         /// Fire-and-forget — buffered + POSTed in batches. No-op when `telemetry: .disabled`.
         func track(name: String, context: [String: Any])
 
