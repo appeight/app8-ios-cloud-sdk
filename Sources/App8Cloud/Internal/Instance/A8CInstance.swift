@@ -9,6 +9,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
 
     var onScreenRendered: ((App8Cloud.RenderEvent) -> Void)?
     var onFallbackInvoked: ((App8Cloud.FallbackEvent) -> Void)?
+    var onPrefetchCompleted: ((App8Cloud.PrefetchEvent) -> Void)?
 
     // MARK: - Event + Analytics passthrough
 
@@ -529,24 +530,51 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         screens: [App8Cloud.PrefetchTarget],
         includingAssets: Bool
     ) async {
-        inFlightPrefetch?.cancel()
-
-        let log = self.log
-        let ds = self.dataSource
+        let previous = inFlightPrefetch
         let started = Date()
         let screenCount = screens.count
-        let task = Task.detached { [weak self] in
-            guard self != nil else { return PrefetchSummary() }
-            return await Self.runPrefetch(
+
+        let task = Task { [weak self] () -> PrefetchSummary in
+            // Wait for any prior task to settle before writing meta.json /
+            // per-screen _meta.json — otherwise rapid calls race them.
+            if let previous {
+                previous.cancel()
+                _ = await previous.value
+            }
+            guard let self else { return PrefetchSummary() }
+            if Task.isCancelled {
+                var s = PrefetchSummary()
+                s.cancelled = true
+                return s
+            }
+
+            let snapshot = await self.fetchSnapshotBestEffort()
+            let freshnessBy = self.freshnessLookup(snapshot)
+            if Task.isCancelled {
+                var s = PrefetchSummary()
+                s.cancelled = true
+                return s
+            }
+
+            let ds = self.dataSource
+            let log = self.log
+            let summary = await Self.runPrefetch(
                 dataSource: ds,
+                snapshot: snapshot,
                 screens: screens,
+                freshnessBy: freshnessBy,
+                skipManifestRefresh: false,
                 includingAssets: includingAssets,
                 log: log
             )
+
+            if !Task.isCancelled, includingAssets, !screens.isEmpty {
+                await self.engine.prefetchImages(forScreens: screens.map(\.id))
+            }
+            return summary
         }
         inFlightPrefetch = task
         let summary = await task.value
-        // Only clear if a later prefetch call hasn't already replaced it.
         if inFlightPrefetch == task { inFlightPrefetch = nil }
         emitPrefetchTelemetry(
             scope: "specific",
@@ -559,78 +587,136 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
 
     /// Union backend `/screens` + engine BFS; backend wins (has version pins).
     func prefetchAll(includingAssets: Bool) async {
-        let log = self.log
-        let ds = self.dataSource
-        let engine = self.engine
+        let previous = inFlightPrefetch
+        let started = Date()
         let dslMax = self.maxSupportedDslVersion
-        inFlightPrefetch?.cancel()
 
-        let discoveryStarted = Date()
+        let task = Task { [weak self] () -> PrefetchSummary in
+            if let previous {
+                previous.cancel()
+                _ = await previous.value
+            }
+            guard let self else { return PrefetchSummary() }
+            if Task.isCancelled {
+                var s = PrefetchSummary()
+                s.cancelled = true
+                return s
+            }
 
-        // Sequential — `engine` is non-Sendable so async-let'ing trips strict-concurrency.
-        var publishedTargets: [App8Cloud.PrefetchTarget] = []
-        do {
-            if let published = try await ds.fetchPublishedScreens() {
+            let ds = self.dataSource
+            let log = self.log
+            let engine = self.engine
+
+            let discoveryStarted = Date()
+
+            let snapshot: RenderingDataSource.PublishedSnapshot?
+            do {
+                snapshot = try await ds.fetchPublishedScreens()
+            } catch {
+                log.warning("[Prefetch] /screens fetch failed: \(error). Falling back to flow BFS only.")
+                snapshot = nil
+            }
+            if Task.isCancelled {
+                var s = PrefetchSummary()
+                s.cancelled = true
+                return s
+            }
+
+            // Manifest must be fresh before BFS — otherwise BFS walks stale nav.
+            do {
+                _ = try await ds.refreshManifestIfChanged(
+                    expectedUpdatedAt: snapshot?.resources?.manifest
+                )
+            } catch {
+                log.warning("[Prefetch] manifest refresh failed: \(error). BFS will run against stale manifest.")
+            }
+            if Task.isCancelled {
+                var s = PrefetchSummary()
+                s.cancelled = true
+                return s
+            }
+
+            var publishedTargets: [App8Cloud.PrefetchTarget] = []
+            if let snapshot {
                 var skipped = 0
-                for p in published {
+                for p in snapshot.screens {
                     if Self.dslVersion(p.minDslVersion, isAtMost: dslMax) {
                         publishedTargets.append(App8Cloud.PrefetchTarget(id: p.screenKey, version: p.version))
                     } else {
                         skipped += 1
                     }
                 }
-                log.info("[Prefetch] backend lists \(published.count) published screen(s); kept \(publishedTargets.count), skipped \(skipped) above DSL max \(dslMax).")
+                log.info("[Prefetch] backend lists \(snapshot.screens.count) published screen(s); kept \(publishedTargets.count), skipped \(skipped) above DSL max \(dslMax).")
             }
-        } catch {
-            log.warning("[Prefetch] /screens fetch failed: \(error). Falling back to flow BFS only.")
-        }
 
-        var bfsTargets: [App8Cloud.PrefetchTarget] = []
-        do {
-            let ids = try await engine.discoverAllReachableScreenIds()
-            bfsTargets = ids.map { App8Cloud.PrefetchTarget(id: $0, version: nil) }
-        } catch {
-            log.warning("[Prefetch] flow BFS failed: \(error)")
-        }
+            var bfsTargets: [App8Cloud.PrefetchTarget] = []
+            do {
+                let ids = try await engine.discoverAllReachableScreenIds()
+                bfsTargets = ids.map { App8Cloud.PrefetchTarget(id: $0, version: nil) }
+            } catch {
+                log.warning("[Prefetch] flow BFS failed: \(error)")
+            }
 
-        var seen = Set<String>()
-        var targets: [App8Cloud.PrefetchTarget] = []
-        for t in publishedTargets where seen.insert(t.id).inserted {
-            targets.append(t)
-        }
-        for t in bfsTargets where seen.insert(t.id).inserted {
-            targets.append(t)
-        }
+            var seen = Set<String>()
+            var targets: [App8Cloud.PrefetchTarget] = []
+            for t in publishedTargets where seen.insert(t.id).inserted {
+                targets.append(t)
+            }
+            for t in bfsTargets where seen.insert(t.id).inserted {
+                targets.append(t)
+            }
 
-        let discoveryMs = Int(Date().timeIntervalSince(discoveryStarted) * 1000)
-        if targets.isEmpty {
-            log.warning("[Prefetch] no screens discovered — only app-level state will be warmed.")
-        } else {
-            log.info("[Prefetch] discovered \(targets.count) screen(s) in \(discoveryMs)ms (backend \(publishedTargets.count) + BFS \(bfsTargets.count) unioned): \(targets.map(\.id).sorted())")
-        }
+            let discoveryMs = Int(Date().timeIntervalSince(discoveryStarted) * 1000)
+            if targets.isEmpty {
+                log.warning("[Prefetch] no screens discovered — only app-level state will be warmed.")
+            } else {
+                log.info("[Prefetch] discovered \(targets.count) screen(s) in \(discoveryMs)ms (backend \(publishedTargets.count) + BFS \(bfsTargets.count) unioned): \(targets.map(\.id).sorted())")
+            }
 
-        let started = Date()
-        let screenCount = targets.count
-        let task = Task.detached { [weak self] in
-            guard self != nil else { return PrefetchSummary() }
-            return await Self.runPrefetch(
+            let freshnessBy = self.freshnessLookup(snapshot)
+            let summary = await Self.runPrefetch(
                 dataSource: ds,
+                snapshot: snapshot,
                 screens: targets,
+                freshnessBy: freshnessBy,
+                skipManifestRefresh: true,
                 includingAssets: includingAssets,
                 log: log
             )
+
+            if !Task.isCancelled, includingAssets, !targets.isEmpty {
+                await engine.prefetchImages(forScreens: targets.map(\.id))
+            }
+            return summary
         }
         inFlightPrefetch = task
         let summary = await task.value
-        // Only clear if a later prefetch call hasn't already replaced it.
         if inFlightPrefetch == task { inFlightPrefetch = nil }
         emitPrefetchTelemetry(
             scope: "all",
-            screenCount: screenCount,
+            screenCount: summary.targetsCount,
             summary: summary,
             includingAssets: includingAssets,
             started: started
         )
+    }
+
+    private func fetchSnapshotBestEffort() async -> RenderingDataSource.PublishedSnapshot? {
+        do {
+            return try await dataSource.fetchPublishedScreens()
+        } catch {
+            log.warning("[Prefetch] /screens fetch failed: \(error). Using hash-only freshness.")
+            return nil
+        }
+    }
+
+    private func freshnessLookup(_ snapshot: RenderingDataSource.PublishedSnapshot?) -> [String: ScreenFreshness] {
+        guard let snapshot else { return [:] }
+        var out: [String: ScreenFreshness] = [:]
+        for p in snapshot.screens {
+            out[p.screenKey] = ScreenFreshness(version: p.version, updatedAt: p.updatedAt)
+        }
+        return out
     }
 
     private func emitPrefetchTelemetry(
@@ -640,13 +726,39 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         includingAssets: Bool,
         started: Date
     ) {
-        guard let telemetry else { return }
         let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+
+        // Fires even when remote telemetry is disabled.
+        if let onPrefetchCompleted {
+            onPrefetchCompleted(App8Cloud.PrefetchEvent(
+                durationMs: durationMs,
+                scope: scope,
+                manifest: summary.manifestStatus,
+                styles: summary.stylesStatus,
+                components: summary.componentsStatus,
+                localizations: summary.localizationsStatus,
+                manifestReason: summary.manifestReason,
+                stylesReason: summary.stylesReason,
+                componentsReason: summary.componentsReason,
+                localizationsReason: summary.localizationsReason,
+                screensCount: screenCount,
+                screensCached: summary.unchangedCount,
+                screensRefreshed: summary.refreshedCount,
+                screensInvalidated: summary.invalidatedCount,
+                screensFailed: summary.failureCount,
+                cancelled: summary.cancelled
+            ))
+        }
+
+        guard let telemetry else { return }
         let ctx: [String: Any] = [
             "scope": scope,
             "screenCount": screenCount,
             "successCount": summary.successCount,
             "failureCount": summary.failureCount,
+            "refreshedCount": summary.refreshedCount,
+            "unchangedCount": summary.unchangedCount,
+            "invalidatedCount": summary.invalidatedCount,
             "includingAssets": includingAssets,
             "cancelled": summary.cancelled,
             "durationMs": durationMs
@@ -659,9 +771,21 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         ))
     }
 
+    /// Fire-and-forget. The next `prefetch()` awaits the cancelled task
+    /// internally so the one-writer-at-a-time invariant on `meta.json` holds.
     func cancelPrefetch() {
         inFlightPrefetch?.cancel()
         inFlightPrefetch = nil
+    }
+
+    private static func appResourceStatus(
+        _ outcome: RenderingDataSource.PrefetchOutcome
+    ) -> (App8Cloud.PrefetchEvent.AppResourceStatus, String?) {
+        switch outcome {
+        case .cachedFresh:           return (.cached, nil)
+        case .unchanged:             return (.unchanged, nil)
+        case .refreshed(let reason): return (.refreshed, reason.rawValue)
+        }
     }
 
     /// `.numeric` so "1.10" > "1.2". Pre-release tags unsupported.
@@ -670,67 +794,139 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         return result != .orderedDescending
     }
 
+    /// `refreshedCount` + `unchangedCount` partition `successCount`.
+    /// `invalidatedCount` is a subset of `refreshedCount` (precheck wipes only).
     struct PrefetchSummary: Sendable {
+        var targetsCount: Int = 0
         var successCount: Int = 0
         var failureCount: Int = 0
+        var refreshedCount: Int = 0
+        var unchangedCount: Int = 0
+        var invalidatedCount: Int = 0
         var cancelled: Bool = false
+        var manifestStatus: App8Cloud.PrefetchEvent.AppResourceStatus = .notRun
+        var stylesStatus: App8Cloud.PrefetchEvent.AppResourceStatus = .notRun
+        var componentsStatus: App8Cloud.PrefetchEvent.AppResourceStatus = .notRun
+        var localizationsStatus: App8Cloud.PrefetchEvent.AppResourceStatus = .notRun
+        var manifestReason: String?
+        var stylesReason: String?
+        var componentsReason: String?
+        var localizationsReason: String?
     }
 
     private static func runPrefetch(
         dataSource: RenderingDataSource,
+        snapshot: RenderingDataSource.PublishedSnapshot?,
         screens: [App8Cloud.PrefetchTarget],
+        freshnessBy: [String: ScreenFreshness],
+        skipManifestRefresh: Bool,
         includingAssets: Bool,
         log: Diagnostics
     ) async -> PrefetchSummary {
+        let prefetchStart = Date()
         var summary = PrefetchSummary()
-        do {
-            let appStarted = Date()
-            _ = try await dataSource.getApp()
-            log.info("Prefetch: getApp \(Int(Date().timeIntervalSince(appStarted) * 1000))ms")
+        summary.targetsCount = screens.count
 
-            let stylesStarted = Date()
-            _ = try await dataSource.getStyles()
-            log.info("Prefetch: getStyles \(Int(Date().timeIntervalSince(stylesStarted) * 1000))ms")
-
-            let componentsStarted = Date()
-            _ = try await dataSource.getComponents()
-            log.info("Prefetch: getComponents \(Int(Date().timeIntervalSince(componentsStarted) * 1000))ms")
-
-            // Non-fatal: a backend that hasn't deployed `/localizations`
-            // yet must not abort the rest of prefetch. Engine then leaves
-            // TranslationStore empty and i18n keys render as raw keys.
-            let localizationsStarted = Date()
+        // Cancellation checks between refreshes stop a cancelled task from
+        // continuing to write meta.json. Per-resource outcomes land on the
+        // summary log line below — no per-call logs.
+        if !skipManifestRefresh {
+            if Task.isCancelled { summary.cancelled = true; return summary }
             do {
-                _ = try await dataSource.getTranslations()
-                log.info("Prefetch: getTranslations \(Int(Date().timeIntervalSince(localizationsStarted) * 1000))ms")
+                let outcome = try await dataSource.refreshManifestIfChanged(
+                    expectedUpdatedAt: snapshot?.resources?.manifest
+                )
+                let (status, reason) = appResourceStatus(outcome)
+                summary.manifestStatus = status
+                summary.manifestReason = reason
             } catch {
-                log.warning("Prefetch: getTranslations skipped — \(error)")
+                summary.manifestStatus = .failed
+                log.warning("Prefetch: manifest refresh failed: \(error)")
             }
+        } else {
+            summary.manifestStatus = .skipped
+        }
+        if Task.isCancelled { summary.cancelled = true; return summary }
+        do {
+            let outcome = try await dataSource.refreshStylesIfChanged(
+                expectedUpdatedAt: snapshot?.resources?.styles
+            )
+            let (status, reason) = appResourceStatus(outcome)
+            summary.stylesStatus = status
+            summary.stylesReason = reason
         } catch {
-            log.warning("Prefetch: app-level warm failed: \(error)")
+            summary.stylesStatus = .failed
+            log.warning("Prefetch: styles refresh failed: \(error)")
+        }
+        if Task.isCancelled { summary.cancelled = true; return summary }
+        do {
+            let outcome = try await dataSource.refreshComponentsIfChanged(
+                expectedUpdatedAt: snapshot?.resources?.components
+            )
+            let (status, reason) = appResourceStatus(outcome)
+            summary.componentsStatus = status
+            summary.componentsReason = reason
+        } catch {
+            summary.componentsStatus = .failed
+            log.warning("Prefetch: components refresh failed: \(error)")
+        }
+        if Task.isCancelled { summary.cancelled = true; return summary }
+        // Localizations are non-fatal — backends that haven't shipped the
+        // endpoint yet still let the rest of prefetch finish.
+        do {
+            let outcome = try await dataSource.refreshLocalizationsIfChanged(
+                expectedUpdatedAt: snapshot?.resources?.localizations
+            )
+            let (status, reason) = appResourceStatus(outcome)
+            summary.localizationsStatus = status
+            summary.localizationsReason = reason
+        } catch {
+            summary.localizationsStatus = .failed
+            log.warning("Prefetch: localizations refresh skipped — \(error)")
         }
 
-        if includingAssets {
-            let fontsStarted = Date()
-            await dataSource.prepareFontsIfNeeded()
-            log.info("Prefetch: prepareFonts \(Int(Date().timeIntervalSince(fontsStarted) * 1000))ms")
+        // Always warm the asset manifest — even on `includingAssets: false`,
+        // skipping it would re-fetch at first render-time font lookup.
+        if Task.isCancelled { summary.cancelled = true; return summary }
+        await dataSource.prepareFontsIfNeeded()
+
+        func emitSummary() {
+            let totalMs = Int(Date().timeIntervalSince(prefetchStart) * 1000)
+            func render(_ s: App8Cloud.PrefetchEvent.AppResourceStatus, _ reason: String?) -> String {
+                if s == .refreshed, let reason { return "\(s.rawValue)(\(reason))" }
+                return s.rawValue
+            }
+            log.info("[Prefetch] done in \(totalMs)ms — app: " +
+                     "{manifest=\(render(summary.manifestStatus, summary.manifestReason)), " +
+                     "styles=\(render(summary.stylesStatus, summary.stylesReason)), " +
+                     "components=\(render(summary.componentsStatus, summary.componentsReason)), " +
+                     "localizations=\(render(summary.localizationsStatus, summary.localizationsReason))} — screens: " +
+                     "cached=\(summary.unchangedCount) refreshed=\(summary.refreshedCount) " +
+                     "invalidated=\(summary.invalidatedCount) failed=\(summary.failureCount)" +
+                     (summary.cancelled ? " cancelled" : ""))
         }
 
-        guard !screens.isEmpty else { return summary }
-        enum Outcome { case success, failure, cancelled }
+        guard !screens.isEmpty else { emitSummary(); return summary }
+        enum Outcome: Sendable {
+            case success(RenderingDataSource.PrefetchOutcome)
+            case failure
+            case cancelled
+        }
         await withTaskGroup(of: Outcome.self) { group in
             let bound = 4
             var iterator = screens.makeIterator()
 
             func enqueueNext() {
                 guard let target = iterator.next() else { return }
+                let expected = freshnessBy[target.id]
                 group.addTask {
                     if Task.isCancelled { return .cancelled }
                     let screenStart = Date()
                     let dslStart = Date()
+                    let outcome: RenderingDataSource.PrefetchOutcome
                     do {
-                        try await dataSource.prefetchScreen(
-                            id: target.id, version: target.version
+                        outcome = try await dataSource.prefetchScreen(
+                            id: target.id, version: target.version, expected: expected
                         )
                     } catch {
                         if Task.isCancelled { return .cancelled }
@@ -749,15 +945,25 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
                         assetsMs = Int(Date().timeIntervalSince(assetsStart) * 1000)
                     }
                     let totalMs = Int(Date().timeIntervalSince(screenStart) * 1000)
-                    log.info("[Prefetch] screen '\(target.id)' done — DSL \(dslMs)ms, assets \(assetsMs)ms, total \(totalMs)ms")
-                    return .success
+                    log.info("[Prefetch] screen '\(target.id)' \(outcome) — DSL \(dslMs)ms, assets \(assetsMs)ms, total \(totalMs)ms")
+                    return .success(outcome)
                 }
             }
 
             for _ in 0..<min(bound, screens.count) { enqueueNext() }
             for await outcome in group {
                 switch outcome {
-                case .success: summary.successCount += 1
+                case .success(let kind):
+                    summary.successCount += 1
+                    switch kind {
+                    case .cachedFresh, .unchanged:
+                        summary.unchangedCount += 1
+                    case .refreshed(let reason):
+                        summary.refreshedCount += 1
+                        if reason == .versionChanged || reason == .updatedAtChanged {
+                            summary.invalidatedCount += 1
+                        }
+                    }
                 case .failure: summary.failureCount += 1
                 case .cancelled: summary.cancelled = true
                 }
@@ -765,6 +971,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
                 enqueueNext()
             }
         }
+        emitSummary()
         return summary
     }
 

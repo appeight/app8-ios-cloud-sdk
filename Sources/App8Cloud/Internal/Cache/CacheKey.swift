@@ -58,6 +58,14 @@ struct CacheLayout: Sendable {
             .appendingPathComponent("\(sanitizedPathComponent(v)).json", isDirectory: false)
     }
 
+    /// Sibling of the DSL files; version pruning skips it.
+    static let screenMetaFilename = "_meta.json"
+
+    func screenMetaFile(screenId: String) -> URL {
+        screenDir(screenId: screenId)
+            .appendingPathComponent(Self.screenMetaFilename, isDirectory: false)
+    }
+
     var datasourcesDir: URL {
         rootForApp.appendingPathComponent("datasources", isDirectory: true)
     }
@@ -76,8 +84,16 @@ struct CacheLayout: Sendable {
         rootForApp.appendingPathComponent("assets", isDirectory: true)
     }
 
+    var assetsManifestFile: URL {
+        assetsDir.appendingPathComponent("manifest.json", isDirectory: false)
+    }
+
     var assetBlobsDir: URL {
         assetsDir.appendingPathComponent("blobs", isDirectory: true)
+    }
+
+    var localizationsFile: URL {
+        rootForApp.appendingPathComponent("localizations.json", isDirectory: false)
     }
 
     var lruDir: URL {

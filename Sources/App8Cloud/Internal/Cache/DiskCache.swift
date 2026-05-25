@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// FileManager-backed; IO errors → nil/false (best-effort).
 final class DiskCache: Sendable {
@@ -9,18 +10,44 @@ final class DiskCache: Sendable {
     /// disables pruning.
     private let versionsToKeep: Int
 
+    /// Guards read-modify-write on `meta.json` — `touchMeta` and
+    /// `updateAppResourceMeta` would otherwise lose entries when interleaved.
+    private let metaLock = OSAllocatedUnfairLock()
+
     init(layout: CacheLayout, versionsToKeep: Int, diagnostics: Diagnostics) {
         self.layout = layout
         self.versionsToKeep = max(0, versionsToKeep)
         self.log = diagnostics
+        // Wipe a stale-schema cache so disk-first readers don't decode
+        // bytes shaped for an older `schemaVersion`.
+        if let existing = MetaStore.readApp(at: layout.metaFile),
+           existing.schemaVersion != CacheLayout.schemaVersion
+        {
+            diagnostics.warning("DiskCache: on-disk schema '\(existing.schemaVersion)' != current '\(CacheLayout.schemaVersion)' — wiping app cache.")
+            try? FileManager.default.removeItem(at: layout.rootForApp)
+        }
         ensureDirectories()
     }
 
     // MARK: - Existence
 
     func hasUsableAppCache() -> Bool {
-        guard let meta = MetaStore.read(at: layout.metaFile) else { return false }
+        guard let meta = MetaStore.readApp(at: layout.metaFile) else { return false }
         return meta.schemaVersion == CacheLayout.schemaVersion
+    }
+
+    // MARK: - Meta reads
+
+    func readAppMeta() -> CacheMeta? {
+        MetaStore.readApp(at: layout.metaFile)
+    }
+
+    func readScreenMeta(screenId: String) -> ScreenMeta? {
+        MetaStore.readScreen(at: layout.screenMetaFile(screenId: screenId))
+    }
+
+    func readAppResourceMeta(key: String) -> ResourceMeta? {
+        readAppMeta()?.appResources?[key]
     }
 
     // MARK: - Reads
@@ -36,8 +63,26 @@ final class DiskCache: Sendable {
         try? Data(contentsOf: layout.componentFile(componentId: componentId))
     }
 
+    func readAllComponents() -> [Data] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: layout.componentsDir, includingPropertiesForKeys: nil
+        ) else { return [] }
+        return entries
+            .filter { $0.pathExtension == "json" }
+            .compactMap { try? Data(contentsOf: $0) }
+    }
+
     func readDatasource(category: String, name: String) -> Data? {
         try? Data(contentsOf: layout.datasourceFile(category: category, name: name))
+    }
+
+    func readLocalizations() -> Data? {
+        try? Data(contentsOf: layout.localizationsFile)
+    }
+
+    func readAssetsManifest() -> Data? {
+        try? Data(contentsOf: layout.assetsManifestFile)
     }
 
     func readStyles() -> [Data] {
@@ -85,6 +130,16 @@ final class DiskCache: Sendable {
     }
 
     @discardableResult
+    func writeLocalizations(_ data: Data) -> Bool {
+        atomicWrite(data, to: layout.localizationsFile)
+    }
+
+    @discardableResult
+    func writeAssetsManifest(_ data: Data) -> Bool {
+        atomicWrite(data, to: layout.assetsManifestFile)
+    }
+
+    @discardableResult
     func writeComponents(_ blobs: [Data], idResolver: (Data) -> String?) -> Bool {
         var allOk = true
         for blob in blobs {
@@ -96,8 +151,38 @@ final class DiskCache: Sendable {
 
     @discardableResult
     func touchMeta(dslVersion: String? = nil) -> Bool {
-        let meta = CacheMeta(sdkVersion: SDKVersion.current, dslVersion: dslVersion)
-        return MetaStore.write(meta, to: layout.metaFile)
+        metaLock.withLock {
+            let existing = MetaStore.readApp(at: layout.metaFile)
+            let meta = CacheMeta(
+                sdkVersion: SDKVersion.current,
+                appResources: existing?.appResources,
+                fetchedAt: Date(),
+                dslVersion: dslVersion ?? existing?.dslVersion
+            )
+            return MetaStore.writeApp(meta, to: layout.metaFile)
+        }
+    }
+
+    @discardableResult
+    func writeScreenMeta(_ meta: ScreenMeta, screenId: String) -> Bool {
+        MetaStore.writeScreen(meta, to: layout.screenMetaFile(screenId: screenId))
+    }
+
+    @discardableResult
+    func updateAppResourceMeta(key: String, meta: ResourceMeta) -> Bool {
+        metaLock.withLock {
+            let existing = MetaStore.readApp(at: layout.metaFile)
+            var resources = existing?.appResources ?? [:]
+            resources[key] = meta
+            let updated = CacheMeta(
+                schemaVersion: CacheLayout.schemaVersion,
+                sdkVersion: SDKVersion.current,
+                appResources: resources,
+                fetchedAt: Date(),
+                dslVersion: existing?.dslVersion
+            )
+            return MetaStore.writeApp(updated, to: layout.metaFile)
+        }
     }
 
     // MARK: - Clear
@@ -125,8 +210,11 @@ final class DiskCache: Sendable {
         ) else { return }
 
         let latestName = "\(CacheLayout.latestVersionSentinel).json"
+        let metaName = CacheLayout.screenMetaFilename
         let versioned = entries.filter {
-            $0.pathExtension == "json" && $0.lastPathComponent != latestName
+            $0.pathExtension == "json"
+                && $0.lastPathComponent != latestName
+                && $0.lastPathComponent != metaName
         }
         guard versioned.count > versionsToKeep else { return }
 
