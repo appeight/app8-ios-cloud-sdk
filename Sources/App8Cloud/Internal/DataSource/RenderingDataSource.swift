@@ -59,6 +59,12 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     /// source. Bound after `A8CInstance` constructs the engine.
     @MainActor private weak var engine: App8.Instance?
 
+    /// Bound by `A8CInstance` after construction. The store is thread-safe
+    /// (internal `OSAllocatedUnfairLock`) and outlives this data source —
+    /// safe to hold strongly. Used by `fetchPublishedScreens` (network
+    /// refresh sink) and `applyScreenResponse` (opportunistic seeding).
+    private let catalogRef = OSAllocatedUnfairLock<ScreenCatalogStore?>(initialState: nil)
+
     init(
         appId: String,
         client: HTTPClient,
@@ -89,6 +95,14 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     @MainActor
     func bind(telemetry: TelemetryClient?) {
         self.telemetry = telemetry
+    }
+
+    func bind(catalog: ScreenCatalogStore) {
+        catalogRef.withLock { $0 = catalog }
+    }
+
+    private func currentCatalog() -> ScreenCatalogStore? {
+        catalogRef.withLock { $0 }
     }
 
     // MARK: - Cache reset
@@ -239,6 +253,15 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     }
 
     func getAllScreenIds() async throws -> [String]? {
+        // Catalog is the authoritative listing when the backend has shipped
+        // `/apps/{id}/screens` — covers the case where the engine asks for
+        // enumeration before any render has run (e.g. diagnostics, BFS).
+        if let catalogSnapshot = currentCatalog()?.publicSnapshot(),
+           catalogSnapshot.backendSupportsEnumeration,
+           !catalogSnapshot.screenIds.isEmpty
+        {
+            return catalogSnapshot.screenIds
+        }
         let ids = state.withLock { $0.allScreenIds }
         if !ids.isEmpty { return ids }
         let disk = cache?.enumerateScreenIds() ?? []
@@ -724,6 +747,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         let finalComponents = nextComponents
         let finalComponentsByDslId = nextComponentsByDslId
 
+        currentCatalog()?.mergeSeen(id: screenId)
         state.withLock { s in
             s.screensByCacheKey[key] = body
             if !s.allScreenIds.contains(screenId) {
@@ -1370,6 +1394,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             }
         } catch App8Cloud.Error.serverError(let status, _) where status == 404 {
             log.debug("[Prefetch] backend has no /apps/{id}/screens endpoint (404) — falling back to flow BFS only.")
+            currentCatalog()?.markBackendUnsupported()
             return nil
         }
         let decoded: ListScreensResponse
@@ -1394,6 +1419,16 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 localizations: $0.localizations?.updatedAt
             )
         }
+        currentCatalog()?.replace(from: ScreenCatalogStore.NetworkSnapshot(
+            screens: screens.map {
+                ScreenCatalogStore.NetworkSnapshot.Screen(
+                    screenKey: $0.screenKey,
+                    version: $0.version,
+                    minDslVersion: $0.minDslVersion,
+                    updatedAt: $0.updatedAt
+                )
+            }
+        ))
         return PublishedSnapshot(screens: screens, resources: resources)
     }
 

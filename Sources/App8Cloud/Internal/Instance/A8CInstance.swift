@@ -39,6 +39,10 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     private let headers: HeaderBuilder
     private let fontRegistry: FontRegistry
     private let maxSupportedDslVersion: String
+    private let catalogStore: ScreenCatalogStore
+    /// Coalesced background refresh of the screen catalog.
+    /// Single in-flight task; concurrent triggers reuse it.
+    private var catalogRefreshTask: Task<Void, Never>?
 
     // MARK: - Per-screen pinned versions (partner-supplied at call time)
 
@@ -124,7 +128,24 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         )
         self.dataSource = ds
         self.engine = App8.instance(dataSource: ds)
+        // Teach both buses the cloud SDK version once. Every subsequent
+        // dispatch — engine-fired or cloud-fired — auto-stamps
+        // `cloudVersion` on the typed field and merges `cloud_version` into
+        // analytics `properties`. Action-bus events get the typed field
+        // only (no canonical-property merge on `payload`).
+        self.engine.analyticsBus.cloudVersion = SDKVersion.current
+        self.engine.eventBus.cloudVersion = SDKVersion.current
         ds.bind(engine: self.engine)
+
+        let catalog = ScreenCatalogStore(
+            appId: appId,
+            diskCache: diskCache,
+            catalogTTL: diskCacheConfig?.catalogTTL ?? (24 * 60 * 60),
+            diagnostics: log
+        )
+        catalog.loadFromDisk()
+        self.catalogStore = catalog
+        ds.bind(catalog: catalog)
 
         // Constructed before any `self`-using calls.
         let telemetryClient: TelemetryClient?
@@ -154,6 +175,14 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
                 "sdkVersion": SDKVersion.current
             ]
         ))
+
+        // Kick off a non-blocking catalog refresh so the very next
+        // `screen(id:)` call after init can already short-circuit unknown
+        // IDs. Cheap: one `GET /apps/{id}/screens` request, coalesced.
+        // If the disk catalog was just hydrated this is still cheap on the
+        // wire when the backend ships ETag/304 — and the in-memory state
+        // remains usable while it's in flight.
+        startCatalogRefreshIfNeeded(force: false)
     }
 
     // MARK: - Identity (Instance protocol)
@@ -197,6 +226,17 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         pinnedVersions[id] = version
         let started = Date()
         log.info("[Render] screen(id='\(id)') start")
+
+        // Short-circuit unknown screen IDs without a network round-trip.
+        // Surfaces the same `.screenNotFound` / `.dslVersionUnsupported`
+        // errors the render path would produce after the round-trip — host
+        // fallback and `screen_render_failed` telemetry stay identical.
+        if let shortCircuitError = shortCircuitError(forScreenId: id, requestedVersion: version) {
+            emitShortCircuitTelemetry(screenId: id, error: shortCircuitError)
+            emitRenderFailedTelemetry(kind: "screen", screenId: id, requestedVersion: version, error: shortCircuitError)
+            throw shortCircuitError
+        }
+
         do {
             let fontsStart = Date()
             await dataSource.ensureScreenFontsRegistered(id: id)
@@ -215,6 +255,12 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             schedulePresentedEvent(vc: vc, kind: "screen", screenId: id)
             return vc
         } catch let cloudError as App8Cloud.Error {
+            // The catalog may claim a screen exists that the backend just
+            // unpublished. Drop the stale entry so subsequent calls can
+            // short-circuit correctly once the next refresh runs.
+            if case .screenNotFound = cloudError {
+                catalogStore.markStaleIfBackendSays404(id: id)
+            }
             emitRenderFailedTelemetry(kind: "screen", screenId: id, requestedVersion: version, error: cloudError)
             throw cloudError
         } catch let e as App8.Error {
@@ -343,18 +389,20 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     ) {
         // Fire on the host-facing analytics bus independently of the cloud
         // SDK's remote-telemetry POST opt-out (see `telemetry` below). Gated
-        // by the engine's `autoScreenEvents` flag — same gate the engine uses
-        // for `app8_screen_appeared` / `app8_screen_dismissed`, since
-        // `app8_render_failed` is a screen-lifecycle signal in the same family.
-        if engine.analyticsConfig.autoScreenEvents {
+        // by the engine's `autoCloudEvents` flag — cloud render telemetry now
+        // has its own toggle, separate from the engine's screen lifecycle
+        // gate (`autoScreenEvents`, which only controls `app8.screen.appeared`
+        // / `app8.screen.dismissed`). Hosts who used `autoScreenEvents=false`
+        // to silence cloud render failures must migrate to `autoCloudEvents`.
+        if engine.analyticsConfig.autoCloudEvents {
             var props: [String: Any] = [
                 "kind": kind,
                 "reason": telemetryReasonString(error)
             ]
-            if let requestedVersion { props["requestedVersion"] = requestedVersion }
+            if let requestedVersion { props["requested_version"] = requestedVersion }
             if case let .dslVersionUnsupported(found, max) = error {
-                props["dslVersionRequired"] = found
-                props["dslVersionClientMax"] = max
+                props["dsl_version_required"] = found
+                props["dsl_version_client_max"] = max
             }
             if case let .screenVersionNotFound(_, version) = error {
                 props["version"] = version
@@ -363,7 +411,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
                 props["status"] = status
             }
             engine.analyticsBus.dispatch(App8AnalyticsEvent(
-                name: "app8_render_failed",
+                name: App8AnalyticsEvent.Auto.renderFailed,
                 screenId: screenId,
                 componentId: nil,
                 componentType: nil,
@@ -396,20 +444,19 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     }
 
     private func emitFallbackTelemetry(error: App8Cloud.Error, screenId: String?) {
-        // Mirror `app8_render_failed`: hosts want fallback signal on the same
+        // Mirror `app8.render.failed`: hosts want fallback signal on the same
         // bus they get screen-lifecycle events on, independent of the cloud
-        // SDK's remote-telemetry POST opt-out below. Gated by the engine's
-        // `autoScreenEvents` flag — `app8_render_fallback` is a
-        // screen-lifecycle signal in the same family.
-        if engine.analyticsConfig.autoScreenEvents {
+        // SDK's remote-telemetry POST opt-out below. Gated by `autoCloudEvents`
+        // alongside the other cloud render events.
+        if engine.analyticsConfig.autoCloudEvents {
             let kind = (screenId == appRenderScreenKey) ? "app" : "screen"
             var props: [String: Any] = [
                 "kind": kind,
                 "reason": telemetryReasonString(error)
             ]
             if case let .dslVersionUnsupported(found, max) = error {
-                props["dslVersionRequired"] = found
-                props["dslVersionClientMax"] = max
+                props["dsl_version_required"] = found
+                props["dsl_version_client_max"] = max
             }
             if case let .screenVersionNotFound(_, version) = error {
                 props["version"] = version
@@ -418,7 +465,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
                 props["status"] = status
             }
             engine.analyticsBus.dispatch(App8AnalyticsEvent(
-                name: "app8_render_fallback",
+                name: App8AnalyticsEvent.Auto.renderFallback,
                 screenId: screenId,
                 componentId: nil,
                 componentType: nil,
@@ -463,6 +510,31 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             servedLocale: engine.currentLocale
         )
         onScreenRendered?(event)
+
+        // Fire `app8.screen.rendered` on the analytics bus — the success arm
+        // that pairs with `app8.render.failed` / `app8.render.fallback`.
+        // Gated by `autoCloudEvents`. Fires after `onScreenRendered?(event)`
+        // so the existing `App8Cloud.RenderEvent` callback ordering is
+        // preserved. Property keys use the canonical snake_case convention;
+        // the bus then merges `screen_id`, `locale`, `engine_version`,
+        // `cloud_version` on top.
+        if engine.analyticsConfig.autoCloudEvents {
+            var props: [String: Any] = [
+                "kind": kind,
+                "render_ms": durationMs,
+                "from_cache": fromCache
+            ]
+            if let served { props["served_version"] = served }
+            if let requestedVersion { props["requested_version"] = requestedVersion }
+            engine.analyticsBus.dispatch(App8AnalyticsEvent(
+                name: App8AnalyticsEvent.Auto.screenRendered,
+                screenId: screenId,
+                componentId: nil,
+                componentType: nil,
+                properties: props
+            ))
+        }
+
         guard let telemetry else { return }
         var ctx: [String: Any] = [
             "kind": kind,
@@ -993,6 +1065,185 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         }.value
         // In-memory cache also needs reset — otherwise next prefetch skips re-fetch.
         dataSource.resetInMemoryState(scope: scope)
+        if case .all = scope {
+            // `cache?.clearAll()` already wiped `screens_catalog.json` along
+            // with the rest of `rootForApp`. Drop the in-memory mirror and
+            // kick off a background refresh so the next render isn't stuck
+            // with a dead-empty catalog if the host immediately calls
+            // `screen(id:)` after `clearCache(.all)`.
+            catalogStore.resetForCacheClear()
+            startCatalogRefreshIfNeeded(force: true)
+        }
+    }
+
+    // MARK: - Screen availability (Instance protocol)
+
+    func availability(of screenId: String) -> App8Cloud.ScreenAvailability {
+        switch catalogStore.availability(of: screenId) {
+        case .known:           return .known
+        case .unknownFresh:    return .unknown
+        case .unknownStale:    return .catalogNotLoaded
+        case .catalogNotLoaded: return .catalogNotLoaded
+        }
+    }
+
+    var catalog: App8Cloud.ScreenCatalog? {
+        catalogStore.publicSnapshot()
+    }
+
+    @discardableResult
+    func awaitCatalogReady(timeout: TimeInterval) async -> App8Cloud.ScreenCatalog? {
+        if let snapshot = catalogStore.publicSnapshot() {
+            return snapshot
+        }
+        startCatalogRefreshIfNeeded(force: false)
+        guard let task = catalogRefreshTask else {
+            return catalogStore.publicSnapshot()
+        }
+        // Race the in-flight refresh against the caller-supplied timeout.
+        // Returning nil on timeout (vs. partial snapshot) is intentional —
+        // partners use this method to assert "catalog is ready", and a
+        // nil-on-timeout contract keeps that promise unambiguous.
+        let didFinish: Bool = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                _ = await task.value
+                return true
+            }
+            group.addTask {
+                let ns = UInt64(max(0, timeout) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: ns)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        return didFinish ? catalogStore.publicSnapshot() : nil
+    }
+
+    func refreshCatalog() async {
+        startCatalogRefreshIfNeeded(force: true)
+        if let task = catalogRefreshTask {
+            _ = await task.value
+        }
+    }
+
+    // MARK: - Catalog internals
+
+    /// Identity token for the currently-installed refresh task. Bumped on
+    /// every `startCatalogRefreshIfNeeded` that replaces the slot, so the
+    /// finisher in `performCatalogRefresh` can distinguish "I'm still the
+    /// owner, clear the slot" from "I've been replaced, leave the new task
+    /// alone." Sidesteps the old race where a stale finisher would nil out
+    /// a freshly-installed successor.
+    private var catalogRefreshTaskId: UUID?
+
+    /// `force=true` always starts a refresh even if one is in flight; the
+    /// in-flight task is cancelled and replaced so the slot identity always
+    /// points at the freshest refresh. HTTP-level dedup (`InFlightCoalescer`
+    /// keyed on `Endpoint.listScreens`) still collapses overlapping GETs.
+    /// `force=false` is a no-op when a refresh is already running.
+    private func startCatalogRefreshIfNeeded(force: Bool) {
+        if !force, catalogRefreshTask != nil { return }
+        // On force=true we replace any in-flight task. Cancel the old one so
+        // it exits via the cancellation path instead of running to completion
+        // (HTTP coalescer still serves it the shared response — cancellation
+        // here is about avoiding stale catalog mutations after the new task
+        // has already produced a fresher snapshot).
+        catalogRefreshTask?.cancel()
+        let token = UUID()
+        catalogRefreshTaskId = token
+        catalogRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            await self.performCatalogRefresh(token: token)
+        }
+    }
+
+    private func performCatalogRefresh(token: UUID) async {
+        do {
+            // `fetchPublishedScreens()` updates the catalog as a side effect
+            // (replace on success, mark-unsupported on 404). The discard
+            // here is intentional — A8CInstance doesn't need the snapshot,
+            // it consults the catalog store directly.
+            _ = try await dataSource.fetchPublishedScreens()
+        } catch {
+            log.warning("[Catalog] background refresh failed: \(error). Will retry on next trigger.")
+        }
+        // Clear the slot ONLY if this task still owns it. A concurrent
+        // `force: true` arrived while we were awaiting → token mismatch →
+        // the new task owns the slot and is responsible for clearing it.
+        if catalogRefreshTaskId == token {
+            catalogRefreshTask = nil
+            catalogRefreshTaskId = nil
+        }
+    }
+
+    private func shortCircuitError(
+        forScreenId id: String,
+        requestedVersion: String?
+    ) -> App8Cloud.Error? {
+        switch catalogStore.availability(of: id) {
+        case .known(let entry, _, _):
+            // DSL gate is only meaningful for the "latest" path — for a
+            // version-pinned request, the server is the authority on what
+            // minDslVersion that specific version requires.
+            if requestedVersion == nil,
+               let minDsl = entry.minDslVersion,
+               !Self.dslVersion(minDsl, isAtMost: maxSupportedDslVersion)
+            {
+                return .dslVersionUnsupported(found: minDsl, max: maxSupportedDslVersion)
+            }
+            return nil
+        case .unknownFresh:
+            return .screenNotFound(screenId: id)
+        case .unknownStale:
+            // Catalog is older than its TTL — a just-published screen could
+            // be missing from it. Fall through to the network and refresh
+            // the catalog in the background as a side effect.
+            startCatalogRefreshIfNeeded(force: false)
+            return nil
+        case .catalogNotLoaded:
+            // No authoritative answer yet (fresh install, no `/screens`
+            // endpoint, or refresh still in flight). Trigger one and fall
+            // through to network — best-effort semantics.
+            startCatalogRefreshIfNeeded(force: false)
+            return nil
+        }
+    }
+
+    private func emitShortCircuitTelemetry(
+        screenId: String,
+        error: App8Cloud.Error
+    ) {
+        let catalogAgeMs = catalogStore.ageSeconds() ?? -1
+        let source = catalogStore.currentSource().rawValue
+        let count = catalogStore.screenCount()
+        if engine.analyticsConfig.autoCloudEvents {
+            engine.analyticsBus.dispatch(App8AnalyticsEvent(
+                name: App8AnalyticsEvent.Auto.screenShortcircuit,
+                screenId: screenId,
+                componentId: nil,
+                componentType: nil,
+                properties: [
+                    "reason": telemetryReasonString(error),
+                    "catalog_age_ms": catalogAgeMs,
+                    "catalog_source": source,
+                    "catalog_screen_count": count
+                ]
+            ))
+        }
+        guard let telemetry else { return }
+        telemetry.enqueue(.init(
+            type: "screen_availability_shortcircuit",
+            occurredAt: Date(),
+            screenKey: screenId,
+            context: [
+                "reason": telemetryReasonString(error),
+                "catalogAge_ms": catalogAgeMs,
+                "catalogSource": source,
+                "catalogScreenCount": count
+            ]
+        ))
     }
 
     // MARK: - RenderingBridge

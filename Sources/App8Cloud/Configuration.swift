@@ -37,15 +37,26 @@ public extension App8Cloud {
         public var rootDirectory: URL?
         public var assetByteBudget: Int64
         public var versionsToKeep: Int
+        /// How long the on-disk screen catalog (from `GET /apps/{id}/screens`)
+        /// is trusted to answer `availability(of:)` and short-circuit unknown
+        /// screen IDs without a network round-trip. Stale (older than this)
+        /// catalogs trigger a background refresh and fall through to the
+        /// network on unknown IDs so a just-published screen isn't masked.
+        /// Set to `0` to never short-circuit (catalog still populates for
+        /// `availability(of:)` queries, but `screen(id:)` always hits network
+        /// for unknown IDs).
+        public var catalogTTL: TimeInterval
 
         public init(
             rootDirectory: URL? = nil,
             assetByteBudget: Int64 = 50 * 1024 * 1024,
-            versionsToKeep: Int = 2
+            versionsToKeep: Int = 2,
+            catalogTTL: TimeInterval = 24 * 60 * 60
         ) {
             self.rootDirectory = rootDirectory
             self.assetByteBudget = assetByteBudget
             self.versionsToKeep = versionsToKeep
+            self.catalogTTL = catalogTTL
         }
     }
 

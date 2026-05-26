@@ -11,10 +11,14 @@
 //     the underlying engine buses
 //   - `setEventHandler(_:)` / `setAnalyticsHandler(_:)` plumb delegates to the
 //     engine buses
-//   - `app8_render_failed` fires on the analytics bus when the throwing
-//     render path throws, gated by `analyticsConfig.autoScreenEvents`
-//   - `app8_render_fallback` fires on the analytics bus when the fallback
-//     path is taken, gated by the same flag
+//   - Cloud render-lifecycle events: `app8.render.failed`, `app8.render.fallback`,
+//     and `app8.screen.rendered` fire on the analytics bus, gated by
+//     `analyticsConfig.autoCloudEvents` (NOT `autoScreenEvents` — that gate
+//     only controls engine lifecycle).
+//   - Init-window invariant: no analytics events fire between
+//     `App8.instance(dataSource:)` returning and the cloud SDK teaching the
+//     bus its version.
+//   - IRON RULE: `autoScreenEvents=false` no longer suppresses cloud events.
 //
 
 import XCTest
@@ -67,6 +71,55 @@ final class EventAnalyticsPassthroughTests: XCTestCase {
                       "Cloud must expose the engine's analyticsBus, not a separate one")
     }
 
+    // MARK: - Version stamping (cloud teaches bus at init)
+
+    func testCloudInitTeachesBusItsVersion() {
+        let cloud = makeInstance()
+        XCTAssertEqual(cloud.engine.analyticsBus.cloudVersion, SDKVersion.current,
+                       "Cloud init must set analyticsBus.cloudVersion to SDKVersion.current")
+        XCTAssertEqual(cloud.engine.eventBus.cloudVersion, SDKVersion.current,
+                       "Cloud init must set eventBus.cloudVersion to SDKVersion.current")
+    }
+
+    func testCloudEventsCarryCloudVersionStamp() {
+        let cloud = makeInstance()
+        let received = Locked<[App8AnalyticsEvent]>([])
+        let sub = cloud.observeAnalytics { received.set(received.get() + [$0]) }
+        defer { sub.cancel() }
+
+        // Dispatch a synthetic analytics event through the cloud-attached bus.
+        cloud.engine.analyticsBus.dispatch(App8AnalyticsEvent(
+            name: "synth.event",
+            screenId: "home",
+            properties: [:]
+        ))
+
+        let event = received.get().first
+        XCTAssertNotNil(event)
+        XCTAssertEqual(event?.cloudVersion, SDKVersion.current)
+        XCTAssertEqual(event?.engineVersion, EngineVersion.current)
+        XCTAssertEqual(event?.properties["cloud_version"] as? String, SDKVersion.current)
+        XCTAssertEqual(event?.properties["engine_version"] as? String, EngineVersion.current)
+    }
+
+    // MARK: - Init-window invariant (D4 regression)
+
+    /// Pins the empty window between `App8.instance(dataSource:)` returning
+    /// and the cloud SDK's teach-bus-cloud-version line running. No analytics
+    /// events should fire there. If a future PR adds an engine-init-time
+    /// event, this test must explicitly re-evaluate that decision.
+    func testNoAnalyticsEventsInInitWindow() {
+        // Subscribe to a freshly-built engine before any cloud wrapping.
+        let engine = App8.instance(dataSource: TestDataSource())
+        let preReceived = Locked<[App8AnalyticsEvent]>([])
+        let sub = engine.analyticsBus.subscribe { preReceived.set(preReceived.get() + [$0]) }
+        defer { sub.cancel() }
+
+        // Construction alone must not fire any analytics events.
+        XCTAssertTrue(preReceived.get().isEmpty,
+                      "Engine construction must not fire analytics events. Adding an engine-init-time event invalidates the init-window invariant; this test must be revisited.")
+    }
+
     // MARK: - analyticsConfig
 
     func testAnalyticsConfigReadsFromEngine() {
@@ -82,6 +135,11 @@ final class EventAnalyticsPassthroughTests: XCTestCase {
         cloud.analyticsConfig = cfg
         XCTAssertFalse(cloud.engine.analyticsConfig.autoComponentTaps,
                        "Setting analyticsConfig on cloud must mutate the engine's config")
+    }
+
+    func testAutoCloudEventsDefaultsTrue() {
+        let cloud = makeInstance()
+        XCTAssertTrue(cloud.analyticsConfig.autoCloudEvents)
     }
 
     // MARK: - Locale
@@ -161,13 +219,13 @@ final class EventAnalyticsPassthroughTests: XCTestCase {
         defer { sub.cancel() }
 
         cloud.engine.analyticsBus.dispatch(App8AnalyticsEvent(
-            name: "app8_screen_appeared",
+            name: App8AnalyticsEvent.Auto.screenAppeared,
             screenId: "home",
             componentId: nil,
             componentType: nil,
             properties: [:]
         ))
-        XCTAssertEqual(received.get(), ["app8_screen_appeared"])
+        XCTAssertEqual(received.get(), [App8AnalyticsEvent.Auto.screenAppeared])
     }
 
     // MARK: - Delegate handlers
@@ -192,7 +250,7 @@ final class EventAnalyticsPassthroughTests: XCTestCase {
         XCTAssertNil(cloud.engine.analyticsBus.delegate)
     }
 
-    // MARK: - app8_render_failed bus emission
+    // MARK: - app8.render.failed bus emission
 
     func testRenderFailedFiresOnAnalyticsBus() async {
         MockURLProtocol.requestHandler = { req in
@@ -212,34 +270,60 @@ final class EventAnalyticsPassthroughTests: XCTestCase {
             // expected
         }
 
-        let failed = received.get().first { $0.name == "app8_render_failed" }
-        XCTAssertNotNil(failed, "app8_render_failed should land on analyticsBus")
+        let failed = received.get().first { $0.name == App8AnalyticsEvent.Auto.renderFailed }
+        XCTAssertNotNil(failed, "app8.render.failed should land on analyticsBus")
         XCTAssertEqual(failed?.screenId, "home")
         XCTAssertEqual(failed?.properties["kind"] as? String, "screen")
-        XCTAssertEqual(failed?.properties["requestedVersion"] as? String, "v1")
+        XCTAssertEqual(failed?.properties["requested_version"] as? String, "v1")
         XCTAssertEqual(failed?.properties["status"] as? Int, 500)
+        // Both versions stamped.
+        XCTAssertEqual(failed?.engineVersion, EngineVersion.current)
+        XCTAssertEqual(failed?.cloudVersion, SDKVersion.current)
     }
 
-    func testRenderFailedSuppressedWhenAutoScreenEventsDisabled() async {
+    func testRenderFailedSuppressedWhenAutoCloudEventsDisabled() async {
         MockURLProtocol.requestHandler = { req in
             (HTTPURLResponse(url: req.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!,
              Data())
         }
 
         let cloud = makeInstance()
-        cloud.engine.analyticsConfig.autoScreenEvents = false
+        cloud.engine.analyticsConfig.autoCloudEvents = false
         let received = Locked<[App8AnalyticsEvent]>([])
         let sub = cloud.observeAnalytics { received.set(received.get() + [$0]) }
         defer { sub.cancel() }
 
         _ = try? await cloud.screen(id: "home", version: nil, parameters: [:])
 
-        let failed = received.get().first { $0.name == "app8_render_failed" }
+        let failed = received.get().first { $0.name == App8AnalyticsEvent.Auto.renderFailed }
         XCTAssertNil(failed,
-                     "app8_render_failed must respect engine.analyticsConfig.autoScreenEvents")
+                     "app8.render.failed must respect engine.analyticsConfig.autoCloudEvents")
     }
 
-    // MARK: - app8_render_fallback bus emission
+    /// IRON RULE regression: callers who used `autoScreenEvents=false` to
+    /// silence cloud render telemetry must migrate to `autoCloudEvents`.
+    /// `autoScreenEvents` now only gates the engine's screen lifecycle.
+    func testAutoScreenEventsDoesNotSuppressCloudEvents() async {
+        MockURLProtocol.requestHandler = { req in
+            (HTTPURLResponse(url: req.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!,
+             Data())
+        }
+
+        let cloud = makeInstance()
+        cloud.engine.analyticsConfig.autoScreenEvents = false  // engine lifecycle off
+        cloud.engine.analyticsConfig.autoCloudEvents = true    // cloud telemetry on
+        let received = Locked<[App8AnalyticsEvent]>([])
+        let sub = cloud.observeAnalytics { received.set(received.get() + [$0]) }
+        defer { sub.cancel() }
+
+        _ = try? await cloud.screen(id: "home", version: nil, parameters: [:])
+
+        let failed = received.get().first { $0.name == App8AnalyticsEvent.Auto.renderFailed }
+        XCTAssertNotNil(failed,
+                        "autoScreenEvents=false must NOT suppress cloud events; only autoCloudEvents=false does")
+    }
+
+    // MARK: - app8.render.fallback bus emission
 
     func testRenderFallbackFiresOnAnalyticsBus() async {
         MockURLProtocol.requestHandler = { req in
@@ -256,21 +340,21 @@ final class EventAnalyticsPassthroughTests: XCTestCase {
             UIViewController()
         }
 
-        let fallback = received.get().first { $0.name == "app8_render_fallback" }
-        XCTAssertNotNil(fallback, "app8_render_fallback should land on analyticsBus")
+        let fallback = received.get().first { $0.name == App8AnalyticsEvent.Auto.renderFallback }
+        XCTAssertNotNil(fallback, "app8.render.fallback should land on analyticsBus")
         XCTAssertEqual(fallback?.screenId, "home")
         XCTAssertEqual(fallback?.properties["kind"] as? String, "screen")
         XCTAssertEqual(fallback?.properties["status"] as? Int, 500)
     }
 
-    func testRenderFallbackSuppressedWhenAutoScreenEventsDisabled() async {
+    func testRenderFallbackSuppressedWhenAutoCloudEventsDisabled() async {
         MockURLProtocol.requestHandler = { req in
             (HTTPURLResponse(url: req.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!,
              Data())
         }
 
         let cloud = makeInstance()
-        cloud.engine.analyticsConfig.autoScreenEvents = false
+        cloud.engine.analyticsConfig.autoCloudEvents = false
         let received = Locked<[App8AnalyticsEvent]>([])
         let sub = cloud.observeAnalytics { received.set(received.get() + [$0]) }
         defer { sub.cancel() }
@@ -279,9 +363,53 @@ final class EventAnalyticsPassthroughTests: XCTestCase {
             UIViewController()
         }
 
-        let fallback = received.get().first { $0.name == "app8_render_fallback" }
+        let fallback = received.get().first { $0.name == App8AnalyticsEvent.Auto.renderFallback }
         XCTAssertNil(fallback,
-                     "app8_render_fallback must respect engine.analyticsConfig.autoScreenEvents")
+                     "app8.render.fallback must respect engine.analyticsConfig.autoCloudEvents")
+    }
+
+    // MARK: - app8.screen.rendered — funnel denominator (success arm)
+
+    /// `app8.screen.rendered` must NOT fire on the render-failure path.
+    /// Funnel correctness — accidental success-arm overcount is the most
+    /// likely silent regression.
+    func testScreenRenderedDoesNotFireOnFailurePath() async {
+        MockURLProtocol.requestHandler = { req in
+            (HTTPURLResponse(url: req.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!,
+             Data())
+        }
+
+        let cloud = makeInstance()
+        let received = Locked<[App8AnalyticsEvent]>([])
+        let sub = cloud.observeAnalytics { received.set(received.get() + [$0]) }
+        defer { sub.cancel() }
+
+        _ = try? await cloud.screen(id: "home", version: nil, parameters: [:])
+
+        let rendered = received.get().first { $0.name == App8AnalyticsEvent.Auto.screenRendered }
+        XCTAssertNil(rendered,
+                     "app8.screen.rendered MUST NOT fire on render-failure path; that would overcount the success arm")
+    }
+
+    /// And not on the host-fallback path either.
+    func testScreenRenderedDoesNotFireOnFallbackPath() async {
+        MockURLProtocol.requestHandler = { req in
+            (HTTPURLResponse(url: req.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!,
+             Data())
+        }
+
+        let cloud = makeInstance()
+        let received = Locked<[App8AnalyticsEvent]>([])
+        let sub = cloud.observeAnalytics { received.set(received.get() + [$0]) }
+        defer { sub.cancel() }
+
+        _ = await cloud.screen(id: "home", version: nil, parameters: [:]) { _ in
+            UIViewController()
+        }
+
+        let rendered = received.get().first { $0.name == App8AnalyticsEvent.Auto.screenRendered }
+        XCTAssertNil(rendered,
+                     "app8.screen.rendered MUST NOT fire when host-fallback runs")
     }
 }
 
@@ -295,4 +423,14 @@ private final class RecordingEventHandler: App8EventHandler {
 @MainActor
 private final class RecordingAnalyticsHandler: App8AnalyticsHandler {
     func app8DidTrack(_ event: App8AnalyticsEvent) {}
+}
+
+private final class TestDataSource: App8DataSource, @unchecked Sendable {
+    func getApp() async throws -> Data { Data() }
+    func getStyles() async throws -> [Data] { [] }
+    func getComponents() async throws -> [Data] { [] }
+    func getComponent(componentId: String) async throws -> Data { Data() }
+    func getAsset(assetId: String?, assetName: String?) async throws -> Data? { nil }
+    func getScreen(screenId: String) async throws -> Data { Data() }
+    func getDatasource(screenId: String, datasourceId: String) async throws -> Data { Data() }
 }

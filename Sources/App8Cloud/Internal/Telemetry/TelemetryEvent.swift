@@ -9,6 +9,13 @@ import Foundation
 ///   fire if the VC is rendered but never installed in a window.
 /// - `screen_render_failed` — fires on every render failure (throwing or fallback path).
 /// - `render_fallback` — fires when the partner's fallback closure is actually invoked.
+/// - `screen_availability_shortcircuit` — fires when `screen(id:)` returns
+///   `.screenNotFound` or `.dslVersionUnsupported` without a network round
+///   trip because the local screen catalog ruled the call out. Always
+///   accompanied by a `screen_render_failed` for the same call, but carries
+///   distinct catalog-freshness context (`catalogAge_ms`, `catalogSource`,
+///   `catalogScreenCount`) so the backend can measure how often the catalog
+///   spares partners a blank screen.
 /// - `prefetch_completed` — fires when a `prefetch(...)` / `prefetchAll(...)` batch finishes.
 /// - `asset_fetch_failed` — fires when an asset blob fetch fails after retries.
 /// - `attributes_set` — fires when `setAttributes(...)` is called.

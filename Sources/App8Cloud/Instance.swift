@@ -88,6 +88,34 @@ public extension App8Cloud {
 
         func clearCache(scope: CacheScope) async
 
+        // MARK: Screen availability
+
+        /// Synchronous, non-blocking. Reflects the SDK's last known catalog
+        /// state (from disk, network refresh, or opportunistic seeding).
+        /// Use this to gate UI surfaces (hide CTAs that target screens the
+        /// backend hasn't published) and to predetermine whether a render
+        /// will succeed without paying a network round-trip.
+        func availability(of screenId: String) -> ScreenAvailability
+
+        /// Current catalog snapshot, or `nil` if the SDK has not yet loaded
+        /// or received one. Suitable for inspecting the full known-screen
+        /// set in host code.
+        var catalog: ScreenCatalog? { get }
+
+        /// Resolves when the catalog is loaded (from disk, network refresh,
+        /// or a confirmed 404 from the listing endpoint). Returns `nil` on
+        /// timeout. Use this on host startup paths that need certainty
+        /// before showing navigation surfaces; otherwise the SDK will
+        /// best-effort short-circuit on its own once the catalog arrives.
+        @discardableResult
+        func awaitCatalogReady(timeout: TimeInterval) async -> ScreenCatalog?
+
+        /// Force-refresh the catalog now. No-op when the backend has not
+        /// shipped the `/apps/{id}/screens` endpoint (404). Safe to call
+        /// from deep-link/push-notification handlers that imply new content
+        /// has been published.
+        func refreshCatalog() async
+
         // MARK: Engine pass-through
 
         @_spi(Advanced)
@@ -100,9 +128,11 @@ public extension App8Cloud {
         var eventBus: App8EventBus { get }
 
         /// Same `App8AnalyticsBus` instance the engine uses. The cloud SDK
-        /// fires its render/fallback analytics events onto this bus too —
-        /// so a host's `App8AnalyticsHandler` sees `app8_render_failed`
-        /// alongside the engine's `app8_screen_appeared` etc.
+        /// fires its render-lifecycle analytics events onto this bus too —
+        /// so a host's `App8AnalyticsHandler` sees `app8.render.failed`,
+        /// `app8.render.fallback`, `app8.screen.shortcircuit`, and
+        /// `app8.screen.rendered` alongside the engine's
+        /// `app8.screen.appeared` / `app8.component.tapped` / etc.
         var analyticsBus: App8AnalyticsBus { get }
 
         var analyticsConfig: App8AnalyticsConfig { get set }

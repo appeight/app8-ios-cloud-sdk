@@ -152,14 +152,24 @@ Combine and `AsyncStream` variants are available as `cloud.events` and
 
 ### Analytics events
 
-The engine auto-fires `app8_*` lifecycle events — `app8_screen_appeared`,
-`app8_screen_dismissed`, `app8_component_tapped`, `app8_navigation_pushed`,
-`app8_url_opened`. The cloud SDK adds `app8_render_failed` and
-`app8_render_fallback` to the same bus. Author-declared analytics events
-(set via an `analytics` JSON binding in the DSL) flow on the same bus.
+The engine auto-fires `app8.*` lifecycle events — `app8.screen.appeared`,
+`app8.screen.dismissed`, `app8.component.tapped`, `app8.navigation.pushed`,
+`app8.url.opened`. The cloud SDK adds four more to the same bus:
+
+- `app8.screen.rendered` — success arm, fires when a `screen(...)` /
+  `startApp(...)` render succeeds. Funnel denominator.
+- `app8.render.failed` — render failed.
+- `app8.render.fallback` — host-supplied fallback ran after a failure.
+- `app8.screen.shortcircuit` — availability precomputed; the cloud
+  short-circuited the request.
+
+Author-declared analytics events (set via an `analytics` JSON binding in the
+DSL) flow on the same bus. Author names get `app8.` prepended automatically
+at dispatch — `stripeConnectClicked` lands as `app8.stripeConnectClicked`.
 
 The canonical pattern is one handler that proxies every event to your real
-tracker:
+tracker — `event.properties` is the fully-merged payload (SDK injects
+`screen_id`, `engine_version`, `cloud_version`, etc. as snake_case keys):
 
 ```swift
 final class App8ToMixpanel: App8AnalyticsHandler {
@@ -178,8 +188,13 @@ cloud.setAnalyticsHandler(App8ToMixpanel())  // held weakly
 
 Tune which auto-events fire by mutating `cloud.analyticsConfig` —
 `autoScreenEvents`, `autoComponentTaps`, `autoNavigationEvents`,
-`autoUrlEvents` (all default `true`). The cloud SDK's render-lifecycle
-emissions are gated by `autoScreenEvents`.
+`autoUrlEvents`, `autoCloudEvents` (all default `true`). The cloud SDK's
+four render-lifecycle events are gated by `autoCloudEvents`. The engine's
+screen lifecycle events stay on their own `autoScreenEvents` toggle.
+
+To strip PII at the bus boundary (e.g. query strings on `app8.url.opened`),
+set `cloud.analyticsBus.redact` — see [`docs/dsl/analytics.md`](https://github.com/appeight/App8Engine/blob/main/docs/dsl/analytics.md#redact-hook-pii-boundary)
+in the engine repo for the contract.
 
 > **Privacy note.** Both buses are entirely in-process. Nothing on these
 > buses is transmitted to App8's servers — that path is the separate,
