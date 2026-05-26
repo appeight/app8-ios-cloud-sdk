@@ -96,6 +96,13 @@ struct CacheLayout: Sendable {
         rootForApp.appendingPathComponent("localizations.json", isDirectory: false)
     }
 
+    /// Persisted screen-availability catalog used to short-circuit unknown
+    /// screen IDs in `App8Cloud.Instance.screen(id:)` without a network
+    /// round-trip. Single small JSON file at the app cache root.
+    var screensCatalogFile: URL {
+        rootForApp.appendingPathComponent("screens_catalog.json", isDirectory: false)
+    }
+
     var lruDir: URL {
         rootForApp.appendingPathComponent("lru", isDirectory: true)
     }

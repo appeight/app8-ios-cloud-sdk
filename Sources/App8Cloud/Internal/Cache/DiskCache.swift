@@ -85,6 +85,10 @@ final class DiskCache: Sendable {
         try? Data(contentsOf: layout.assetsManifestFile)
     }
 
+    func readScreensCatalog() -> Data? {
+        try? Data(contentsOf: layout.screensCatalogFile)
+    }
+
     func readStyles() -> [Data] {
         guard let blob = readStylesBlob() else { return [] }
         return decodeArrayOfBlobs(blob)
@@ -137,6 +141,15 @@ final class DiskCache: Sendable {
     @discardableResult
     func writeAssetsManifest(_ data: Data) -> Bool {
         atomicWrite(data, to: layout.assetsManifestFile)
+    }
+
+    @discardableResult
+    func writeScreensCatalog(_ data: Data) -> Bool {
+        atomicWrite(data, to: layout.screensCatalogFile)
+    }
+
+    func clearScreensCatalog() {
+        try? FileManager.default.removeItem(at: layout.screensCatalogFile)
     }
 
     @discardableResult
