@@ -21,6 +21,9 @@ final class FlowScopedDataSource: App8DataSource, @unchecked Sendable {
     private let version: String?
     private let startScreen: String
     private let screenKeys: [String]
+    /// The flow's own pinned transition registry (raw JSON objects), when the
+    /// backend ships it. Empty → fall back to the app-level registry.
+    private let flowTransitions: [Data]
 
     init(
         parent: RenderingDataSource,
@@ -33,10 +36,11 @@ final class FlowScopedDataSource: App8DataSource, @unchecked Sendable {
         self.version = version
         self.startScreen = manifest.startScreen
         self.screenKeys = manifest.screens.map(\.screenKey)
+        self.flowTransitions = manifest.transitions ?? []
     }
 
     func getApp() async throws -> Data {
-        let manifest: [String: Any] = [
+        var manifest: [String: Any] = [
             "title": flowKey,
             "defaultUserInterfaceStyle": "light",
             "navigation": [
@@ -46,7 +50,21 @@ final class FlowScopedDataSource: App8DataSource, @unchecked Sendable {
                 ],
             ],
         ]
+        // Inject the transition registry so screens that reference a named
+        // transition by id (e.g. a push/fade) animate instead of falling back to
+        // UIKit's plain slide. Prefer the flow's own pinned set; until the
+        // backend ships it, borrow the app-level registry.
+        let transitions = await resolveTransitions()
+        if !transitions.isEmpty {
+            manifest["transitions"] = transitions
+        }
         return try JSONSerialization.data(withJSONObject: manifest, options: [])
+    }
+
+    /// Pinned flow transitions when present, else the app-level registry.
+    private func resolveTransitions() async -> [[String: Any]] {
+        let source = flowTransitions.isEmpty ? await parent.appManifestTransitions() : flowTransitions
+        return source.compactMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
     }
 
     func getScreen(screenId: String) async throws -> Data {

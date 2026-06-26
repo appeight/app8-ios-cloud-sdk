@@ -172,6 +172,19 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         return blob
     }
 
+    /// App-level `transitions` registry from the app manifest, as raw JSON
+    /// object blobs. Fallback for the flow channel: until a published flow
+    /// carries its own pinned transitions, the flow's synthetic manifest borrows
+    /// the app-level set so named transitions keep resolving. Returns `[]` when
+    /// the manifest has no transitions or can't be parsed.
+    func appManifestTransitions() async -> [Data] {
+        guard let blob = try? await getApp(),
+              let obj = try? JSONSerialization.jsonObject(with: blob) as? [String: Any],
+              let arr = obj["transitions"] as? [[String: Any]]
+        else { return [] }
+        return arr.compactMap { try? JSONSerialization.data(withJSONObject: $0, options: []) }
+    }
+
     func getStyles() async throws -> [Data] {
         try await loadStylesIfNeeded()
         return state.withLock { $0.styles }
