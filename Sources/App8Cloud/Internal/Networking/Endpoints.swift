@@ -11,6 +11,15 @@ enum Endpoint {
     case telemetry(appId: String)
     /// Full all-locales bundle the engine loads into `TranslationStore`.
     case localizations(appId: String)
+    // Published flows (gated multi-screen bundles).
+    case listFlows(appId: String)
+    case flow(appId: String, flowKey: String, version: String?)
+    /// Flow-scoped member screen — NOT the same as `.screen`. These bytes are
+    /// only reachable through the flow channel.
+    case flowScreen(appId: String, flowKey: String, screenKey: String, version: String?)
+    /// Flow-pinned styles / components (the flow's design-system version set).
+    case flowStyles(appId: String, flowKey: String, version: String?)
+    case flowComponents(appId: String, flowKey: String, version: String?)
 
     var path: String {
         switch self {
@@ -30,6 +39,16 @@ enum Endpoint {
             return "/apps/\(appId)/telemetry"
         case .localizations(let appId):
             return "/apps/\(appId)/localizations"
+        case .listFlows(let appId):
+            return "/apps/\(appId)/flows"
+        case .flow(let appId, let flowKey, _):
+            return "/apps/\(appId)/flows/\(flowKey)"
+        case .flowScreen(let appId, let flowKey, let screenKey, _):
+            return "/apps/\(appId)/flows/\(flowKey)/screens/\(screenKey)"
+        case .flowStyles(let appId, let flowKey, _):
+            return "/apps/\(appId)/flows/\(flowKey)/styles"
+        case .flowComponents(let appId, let flowKey, _):
+            return "/apps/\(appId)/flows/\(flowKey)/components"
         }
     }
 
@@ -43,6 +62,14 @@ enum Endpoint {
     var queryItems: [URLQueryItem] {
         switch self {
         case .screen(_, _, let version?):
+            return [URLQueryItem(name: "version", value: version)]
+        case .flow(_, _, let version?):
+            return [URLQueryItem(name: "version", value: version)]
+        case .flowScreen(_, _, _, let version?):
+            return [URLQueryItem(name: "version", value: version)]
+        case .flowStyles(_, _, let version?):
+            return [URLQueryItem(name: "version", value: version)]
+        case .flowComponents(_, _, let version?):
             return [URLQueryItem(name: "version", value: version)]
         default:
             return []
@@ -67,6 +94,16 @@ enum Endpoint {
             return "telemetry:\(appId)"
         case .localizations(let appId):
             return "localizations:\(appId)"
+        case .listFlows(let appId):
+            return "list-flows:\(appId)"
+        case .flow(let appId, let flowKey, let version):
+            return "flow:\(appId):\(flowKey):\(version ?? "_latest")"
+        case .flowScreen(let appId, let flowKey, let screenKey, let version):
+            return "flow-screen:\(appId):\(flowKey):\(screenKey):\(version ?? "_latest")"
+        case .flowStyles(let appId, let flowKey, let version):
+            return "flow-styles:\(appId):\(flowKey):\(version ?? "_latest")"
+        case .flowComponents(let appId, let flowKey, let version):
+            return "flow-components:\(appId):\(flowKey):\(version ?? "_latest")"
         }
     }
 

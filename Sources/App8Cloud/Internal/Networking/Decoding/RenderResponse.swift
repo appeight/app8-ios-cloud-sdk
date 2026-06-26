@@ -46,6 +46,21 @@ struct AppManifestResponse: Decodable {
     }
 }
 
+/// `GET /sdk/v1/apps/{id}/flows/{flowKey}?version=…` — the lazy flow manifest.
+/// Member screen bytes are fetched separately from
+/// `/flows/{flowKey}/screens/{screenKey}`.
+struct FlowManifestResponse: Decodable {
+    let servedVersion: String?
+    let startScreen: String
+    let minDslVersion: String?
+    let screens: [ScreenRef]
+
+    struct ScreenRef: Decodable {
+        let screenKey: String
+        let updatedAt: String?
+    }
+}
+
 // MARK: - Optional raw-JSON helpers
 
 extension KeyedDecodingContainer {

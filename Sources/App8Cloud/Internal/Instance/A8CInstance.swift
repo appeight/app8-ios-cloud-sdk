@@ -50,6 +50,20 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
     private var lastServedVersions: [String: String?] = [:]
     private var lastServedFromCache: [String: Bool] = [:]
 
+    // MARK: - Active flow render
+
+    /// A published flow renders through its own engine scoped to the flow
+    /// channel (see `FlowScopedDataSource`). Retained so it + its data source
+    /// outlive the `flow(...)` call; torn down on the next `flow(...)` or
+    /// `stopApp()`. The flow engine's event/analytics buses are forwarded to
+    /// the main engine's buses so host subscribers see in-flow events too.
+    private var flowEngine: App8.Instance?
+    private var flowDataSource: FlowScopedDataSource?
+    private var flowEventSubscription: App8Subscription?
+    private var flowAnalyticsSubscription: App8Subscription?
+    /// Synthetic `screenKey` for flow-level render events.
+    private let flowRenderScreenKey = "<flow>"
+
     // MARK: - Init
 
     init(
@@ -287,7 +301,114 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         }
     }
 
+    func flow(
+        id: String,
+        version: String?
+    ) async throws -> UIViewController {
+        let started = Date()
+        log.info("[Render] flow(id='\(id)') start")
+
+        tearDownActiveFlow()
+
+        do {
+            let manifest = try await dataSource.getFlowManifest(flowKey: id, version: version)
+
+            // DSL gate: a flow requiring a newer DSL than this build supports
+            // must surface a clean `.dslVersionUnsupported` (→ FlowFallback)
+            // instead of being handed to the engine. Unlike the screen catalog
+            // short-circuit, the manifest is fetched per-request, so its
+            // `minDslVersion` is authoritative for the served version — gate
+            // regardless of whether the request was version-pinned.
+            if let minDsl = manifest.minDslVersion,
+               !Self.dslVersion(minDsl, isAtMost: maxSupportedDslVersion)
+            {
+                throw App8Cloud.Error.dslVersionUnsupported(found: minDsl, max: maxSupportedDslVersion)
+            }
+
+            // Pin the whole flow session to the version the manifest actually
+            // resolved to. For an unpinned ("latest") request this freezes
+            // member-screen / styles / components fetches to that concrete
+            // version, so a re-publish mid-flow can't drift them to a newer
+            // version (which would 404 a screen the manifest promised, or
+            // serve cross-version bytes). `servedVersion` is always concrete.
+            let resolvedVersion = manifest.servedVersion ?? version
+
+            let scoped = FlowScopedDataSource(
+                parent: dataSource,
+                flowKey: id,
+                version: resolvedVersion,
+                manifest: manifest
+            )
+            let flowEngine = App8.instance(dataSource: scoped)
+            flowEngine.analyticsBus.cloudVersion = SDKVersion.current
+            flowEngine.eventBus.cloudVersion = SDKVersion.current
+
+            // Forward in-flow events to the main buses host code subscribed to.
+            let mainEventBus = engine.eventBus
+            let mainAnalyticsBus = engine.analyticsBus
+            self.flowEventSubscription = flowEngine.eventBus.subscribe { mainEventBus.dispatch($0) }
+            self.flowAnalyticsSubscription = flowEngine.analyticsBus.subscribe { mainAnalyticsBus.dispatch($0) }
+
+            self.flowDataSource = scoped
+            self.flowEngine = flowEngine
+
+            // Preload the entry screen's fonts AND named image assets (poster,
+            // backgrounds, icons) before first paint — otherwise the screen
+            // renders blank and the media pops in afterward (the "blink"). The
+            // large background video is skipped (streams behind its now-warmed
+            // poster), so launch stays snappy.
+            await dataSource.ensureScreenFontsRegistered(id: manifest.startScreen, using: flowEngine)
+            await dataSource.ensureScreenImagesWarmed(id: manifest.startScreen, using: flowEngine)
+
+            // Render — start screen paints first; members lazy-load on nav.
+            let vc = try await flowEngine.renderFlow(flowId: id)
+
+            // Background-warm fonts AND images for the remaining member screens
+            // so a push to any of them paints immediately. Bounded by the data
+            // source's own concurrency; skipped on teardown.
+            let remaining = manifest.screens.map(\.screenKey).filter { $0 != manifest.startScreen }
+            if !remaining.isEmpty {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    for screenKey in remaining {
+                        guard self.flowEngine === flowEngine else { return } // torn down / replaced
+                        await self.dataSource.ensureScreenFontsRegistered(id: screenKey, using: flowEngine)
+                        await self.dataSource.ensureScreenImagesWarmed(id: screenKey, using: flowEngine)
+                    }
+                }
+            }
+
+            let totalMs = Int(Date().timeIntervalSince(started) * 1000)
+            log.info("[Render] flow(id='\(id)') done — total \(totalMs)ms")
+            fireRenderEvent(kind: "flow", screenId: id, requestedVersion: version, started: started)
+            schedulePresentedEvent(vc: vc, kind: "flow", screenId: id)
+            return vc
+        } catch let cloudError as App8Cloud.Error {
+            tearDownActiveFlow()
+            emitRenderFailedTelemetry(kind: "flow", screenId: id, requestedVersion: version, error: cloudError)
+            throw cloudError
+        } catch let e as App8.Error {
+            tearDownActiveFlow()
+            let cloudError = App8Cloud.Error.engine(e)
+            emitRenderFailedTelemetry(kind: "flow", screenId: id, requestedVersion: version, error: cloudError)
+            throw cloudError
+        }
+    }
+
+    /// Cancel bus forwarding and release the active flow engine + data source.
+    private func tearDownActiveFlow() {
+        flowEventSubscription?.cancel()
+        flowAnalyticsSubscription?.cancel()
+        flowEventSubscription = nil
+        flowAnalyticsSubscription = nil
+        flowEngine?.stopApp()
+        flowEngine = nil
+        flowDataSource = nil
+        dataSource.clearFlowScreenCache()
+    }
+
     func stopApp() {
+        tearDownActiveFlow()
         engine.stopApp()
         if let telemetry {
             Task { await telemetry.shutdown() }
@@ -346,6 +467,37 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         } catch {
             return invokeAppFallback(.engine(.appInitFailed), fallback: fallback)
         }
+    }
+
+    func flow(
+        id: String,
+        version: String?,
+        fallback: @escaping App8Cloud.FlowFallback
+    ) async -> UIViewController {
+        do {
+            return try await flow(id: id, version: version)
+        } catch let cloudError as App8Cloud.Error {
+            return invokeFlowFallback(cloudError, flowId: id, fallback: fallback)
+        } catch let engineError as App8.Error {
+            return invokeFlowFallback(.engine(engineError), flowId: id, fallback: fallback)
+        } catch {
+            return invokeFlowFallback(.engine(.appInitFailed), flowId: id, fallback: fallback)
+        }
+    }
+
+    private func invokeFlowFallback(
+        _ error: App8Cloud.Error,
+        flowId: String,
+        fallback: App8Cloud.FlowFallback
+    ) -> UIViewController {
+        let vc = fallback(error)
+        onFallbackInvoked?(App8Cloud.FallbackEvent(
+            error: error,
+            screenId: flowId,
+            source: .flow
+        ))
+        emitFallbackTelemetry(error: error, screenId: flowRenderScreenKey)
+        return vc
     }
 
     private func invokeScreenFallback(
