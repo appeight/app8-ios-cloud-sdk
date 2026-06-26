@@ -47,6 +47,23 @@ public extension App8Cloud {
             fallback: @escaping ScreenFallback
         ) async -> UIViewController
 
+        /// Render a published flow (a gated multi-screen bundle) by its
+        /// `flow_key`. `version`: nil → latest published. The start screen
+        /// paints first; member screens lazy-load as the user navigates. A
+        /// flow's screens are delivered through the flow channel only — they
+        /// are not reachable via `screen(id:...)`.
+        func flow(
+            id: String,
+            version: String?
+        ) async throws -> UIViewController
+
+        /// Never throws — calls `fallback(error)` on failure.
+        func flow(
+            id: String,
+            version: String?,
+            fallback: @escaping FlowFallback
+        ) async -> UIViewController
+
         /// `version` is reserved for future app-level version pinning and is
         /// currently ignored — the engine always starts the latest app.
         func startApp(version: String?) async throws -> UIViewController
@@ -144,6 +161,23 @@ public extension App8Cloud {
 public extension App8Cloud.Instance {
     func setLocale(_ locale: String?) { engine.setLocale(locale) }
     var currentLocale: String { engine.currentLocale }
+}
+
+// MARK: - Flow render convenience (default version)
+
+public extension App8Cloud.Instance {
+    /// Render the latest published version of a flow.
+    func flow(id: String) async throws -> UIViewController {
+        try await flow(id: id, version: nil)
+    }
+
+    /// Never-throws convenience: latest version.
+    func flow(
+        id: String,
+        fallback: @escaping App8Cloud.FlowFallback
+    ) async -> UIViewController {
+        await flow(id: id, version: nil, fallback: fallback)
+    }
 }
 
 // MARK: - Event + analytics convenience (mirrors App8.Instance)

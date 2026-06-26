@@ -53,6 +53,11 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     }
     private let assetState = OSAllocatedUnfairLock<AssetState>(initialState: .init())
 
+    /// In-memory cache of flow-scoped member screen bytes, keyed by
+    /// `flowKey/screenKey@version`. Kept separate from `state.screensByCacheKey`
+    /// so flow screens never leak into the public single-screen channel.
+    private let flowScreenState = OSAllocatedUnfairLock<[String: Data]>(initialState: [:])
+
     @MainActor private weak var _bridge: RenderingBridge?
 
     /// Weak to avoid a retain cycle — the engine strong-holds this data
@@ -128,17 +133,30 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 s.inFlightFontPrep?.cancel()
                 s.inFlightFontPrep = nil
             }
+            flowScreenState.withLock { $0 = [:] }
         case .screen(let id):
             let prefix = "\(id)@"
             state.withLock { s in
                 s.screensByCacheKey = s.screensByCacheKey.filter { !$0.key.hasPrefix(prefix) }
                 s.allScreenIds.removeAll { $0 == id }
             }
+            // Flow members are keyed `flowKey/screenKey@version`; drop any whose
+            // screenKey matches so a flow re-render refetches this screen too.
+            flowScreenState.withLock {
+                $0 = $0.filter { !$0.key.contains("/\(id)@") }
+            }
         case .assetsOnly:
             // No-op: only the blob cache is wiped (via AssetCache.reset());
             // the in-memory manifest's URLs stay valid.
             break
         }
+    }
+
+    /// Drop the in-memory flow-screen cache. Called on flow teardown — the
+    /// session is over, so member bytes kept for back-navigation are no longer
+    /// needed. Bounds growth to a single active flow session.
+    func clearFlowScreenCache() {
+        flowScreenState.withLock { $0 = [:] }
     }
 
     @MainActor
@@ -152,6 +170,19 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             throw App8Cloud.Error.decodeFailed(context: "getApp", underlying: NoBlobError())
         }
         return blob
+    }
+
+    /// App-level `transitions` registry from the app manifest, as raw JSON
+    /// object blobs. Fallback for the flow channel: until a published flow
+    /// carries its own pinned transitions, the flow's synthetic manifest borrows
+    /// the app-level set so named transitions keep resolving. Returns `[]` when
+    /// the manifest has no transitions or can't be parsed.
+    func appManifestTransitions() async -> [Data] {
+        guard let blob = try? await getApp(),
+              let obj = try? JSONSerialization.jsonObject(with: blob) as? [String: Any],
+              let arr = obj["transitions"] as? [[String: Any]]
+        else { return [] }
+        return arr.compactMap { try? JSONSerialization.data(withJSONObject: $0, options: []) }
     }
 
     func getStyles() async throws -> [Data] {
@@ -272,6 +303,151 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     func streamScreen(screenId: String) -> AsyncStream<Data>? { nil }
     func streamDatasource(screenId: String, datasourceId: String, componentPath: String?) -> AsyncStream<Data>? { nil }
     func streamStyles() -> AsyncStream<Data>? { nil }
+
+    // MARK: - Flow channel (gated multi-screen bundles)
+
+    /// Fetch a published flow's lazy manifest (entry screen + member list).
+    func getFlowManifest(flowKey: String, version: String?) async throws -> FlowManifestResponse {
+        let identity = await readIdentity()
+        let endpoint = Endpoint.flow(appId: appId, flowKey: flowKey, version: version)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        do {
+            return try JSONDecoder().decode(FlowManifestResponse.self, from: raw)
+        } catch {
+            throw App8Cloud.Error.decodeFailed(context: "FlowManifestResponse", underlying: error)
+        }
+    }
+
+    /// Fetch a flow-scoped member screen's DSL bytes. These are reachable ONLY
+    /// through the flow channel — never via `getScreen`. Cached in-memory keyed
+    /// by `flowKey/screenKey@version` so back-navigation doesn't refetch.
+    func getFlowScreenData(flowKey: String, screenKey: String, version: String?) async throws -> Data {
+        let key = "\(flowKey)/\(screenKey)@\(version ?? "_latest")"
+        if let hit = flowScreenState.withLock({ $0[key] }) { return hit }
+
+        let identity = await readIdentity()
+        let endpoint = Endpoint.flowScreen(appId: appId, flowKey: flowKey, screenKey: screenKey, version: version)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        let response: ScreenRenderResponse
+        do {
+            response = try JSONDecoder().decode(ScreenRenderResponse.self, from: raw)
+        } catch {
+            throw App8Cloud.Error.decodeFailed(context: "FlowScreenRenderResponse", underlying: error)
+        }
+        flowScreenState.withLock { $0[key] = response.data }
+        return response.data
+    }
+
+    /// Fetch the flow's pinned styles (backend falls back to app-level latest
+    /// when the flow pinned none). Not disk-cached: the flow engine loads these
+    /// once at init, and the version pin already makes the bytes stable.
+    func getFlowStyles(flowKey: String, version: String?) async throws -> [Data] {
+        let identity = await readIdentity()
+        let endpoint = Endpoint.flowStyles(appId: appId, flowKey: flowKey, version: version)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        do {
+            return try JSONDecoder().decode(StyleArrayResponse.self, from: raw).items
+        } catch {
+            throw App8Cloud.Error.decodeFailed(context: "FlowStyleArrayResponse", underlying: error)
+        }
+    }
+
+    /// Fetch the flow's pinned components (or app-level latest when none pinned).
+    func getFlowComponents(flowKey: String, version: String?) async throws -> [Data] {
+        let identity = await readIdentity()
+        let endpoint = Endpoint.flowComponents(appId: appId, flowKey: flowKey, version: version)
+        let client = self.client
+        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+            let result = try await client.get(endpoint, identity: identity)
+            return result.data
+        }
+        do {
+            return try JSONDecoder().decode(ComponentArrayResponse.self, from: raw).items
+        } catch {
+            throw App8Cloud.Error.decodeFailed(context: "FlowComponentArrayResponse", underlying: error)
+        }
+    }
+
+    /// Register fonts for a screen using a host-supplied engine (e.g. a flow
+    /// engine) rather than the bound app-level engine. Mirrors
+    /// `ensureScreenFontsRegistered(id:)` but lets the flow path preload fonts
+    /// for screens decoded by its own engine.
+    @MainActor
+    func ensureScreenFontsRegistered(id: String, using engine: App8.Instance) async {
+        let refs: App8.AssetReferenceSet
+        do {
+            refs = try await engine.collectAssetReferences(screenId: id)
+        } catch {
+            log.warning("ensureScreenFontsRegistered(using:): collectAssetReferences failed for \(id): \(error)")
+            return
+        }
+        let fontsToFetch = refs.fonts.filter { UIFont(name: $0.postScriptName, size: 1) == nil }
+        if fontsToFetch.isEmpty { return }
+        await withTaskGroup(of: Void.self) { group in
+            let bound = 4
+            var iter = fontsToFetch.makeIterator()
+            func enqueueNext() {
+                guard let fontRef = iter.next() else { return }
+                group.addTask { [weak self] in
+                    guard let self else { return }
+                    await self.downloadAndRegisterFont(fontRef)
+                }
+            }
+            for _ in 0..<min(bound, fontsToFetch.count) { enqueueNext() }
+            for await _ in group { enqueueNext() }
+        }
+    }
+
+    /// Warm a screen's named image assets (poster, backgrounds, icons) into the
+    /// asset cache using a host-supplied engine — so the entry screen paints
+    /// complete instead of blank→pop (the "blink"). The flow's assets are
+    /// `remoteAsset`-by-name (no direct URL), so `prefetchImages` can't warm
+    /// them — they must go through `getAsset`. Skips `video/*` assets: they're
+    /// large and stream behind their (now pre-warmed) poster, so blocking on
+    /// them would just slow first paint. Mirrors `ensureScreenFontsRegistered`.
+    @MainActor
+    func ensureScreenImagesWarmed(id: String, using engine: App8.Instance) async {
+        let refs: App8.AssetReferenceSet
+        do {
+            refs = try await engine.collectAssetReferences(screenId: id)
+        } catch {
+            log.warning("ensureScreenImagesWarmed(using:): collectAssetReferences failed for \(id): \(error)")
+            return
+        }
+        guard !refs.images.isEmpty else { return }
+        let manifest = try? await ensureAssetManifest()
+        let toWarm = refs.images.filter { ref in
+            guard let manifest, let entry = manifest.resolve(id: ref.id, name: ref.name) else {
+                return true // unknown mime — warm it rather than risk a blink
+            }
+            return !(entry.mimeType?.hasPrefix("video/") ?? false)
+        }
+        guard !toWarm.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            let bound = 4
+            var iter = toWarm.makeIterator()
+            func enqueueNext() {
+                guard let ref = iter.next() else { return }
+                group.addTask { [weak self] in
+                    _ = try? await self?.getAsset(assetId: ref.id, assetName: ref.name)
+                }
+            }
+            for _ in 0..<min(bound, toWarm.count) { enqueueNext() }
+            for await _ in group { enqueueNext() }
+        }
+    }
 
     /// Full all-locales payload for `TranslationStore`.
     func getTranslations() async throws -> Data {
@@ -1221,11 +1397,20 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     private struct AssetManifestEntries: Sendable {
         let byId: [String: AssetEntry]
         let byFilename: [String: AssetEntry]
+        /// Filename without extension → entry. DSL `remoteAsset` references use a
+        /// bare name (e.g. "IconMeteors"), while the manifest stores the full
+        /// filename ("IconMeteors.png"), so an exact-filename match alone misses.
+        let byBasename: [String: AssetEntry]
         let expiresAt: Date
 
         func resolve(id: String?, name: String?) -> AssetEntry? {
             if let id, let hit = byId[id] { return hit }
-            if let name, let hit = byFilename[name] { return hit }
+            if let name {
+                // Exact filename first (when the DSL includes the extension),
+                // then the extensionless basename used by `remoteAsset` refs.
+                if let hit = byFilename[name] { return hit }
+                if let hit = byBasename[name] { return hit }
+            }
             return nil
         }
 
@@ -1320,6 +1505,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
     ) -> AssetManifestEntries {
         var byId: [String: AssetEntry] = [:]
         var byFilename: [String: AssetEntry] = [:]
+        var byBasename: [String: AssetEntry] = [:]
         for item in items {
             let entry = AssetEntry(
                 id: item.id,
@@ -1329,8 +1515,14 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
             )
             byId[item.id] = entry
             byFilename[item.filename] = entry
+            // First-wins on basename collisions (e.g. icon.png vs icon.jpg) — a
+            // bare-name DSL ref is ambiguous there anyway; exact-filename still wins.
+            let basename = (item.filename as NSString).deletingPathExtension
+            if !basename.isEmpty, byBasename[basename] == nil {
+                byBasename[basename] = entry
+            }
         }
-        return AssetManifestEntries(byId: byId, byFilename: byFilename, expiresAt: expiresAt)
+        return AssetManifestEntries(byId: byId, byFilename: byFilename, byBasename: byBasename, expiresAt: expiresAt)
     }
 
     private struct PersistedAssetsManifest: Codable, Sendable {
