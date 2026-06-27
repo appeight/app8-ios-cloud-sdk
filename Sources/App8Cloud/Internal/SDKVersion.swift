@@ -7,5 +7,5 @@ import Foundation
 /// to compiled code, so this constant is the single source of truth — it
 /// must be bumped to match the published git tag on every release.
 enum SDKVersion {
-    static let current = "0.3.0"
+    static let current = "0.3.1"
 }
