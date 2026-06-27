@@ -198,6 +198,50 @@ final class DiskCache: Sendable {
         }
     }
 
+    // MARK: - Flow channel reads/writes
+
+    func readFlowManifest(flowKey: String, version: String?) -> Data? {
+        try? Data(contentsOf: layout.flowManifestFile(flowKey: flowKey, version: version))
+    }
+
+    @discardableResult
+    func writeFlowManifest(_ data: Data, flowKey: String, version: String?) -> Bool {
+        atomicWrite(data, to: layout.flowManifestFile(flowKey: flowKey, version: version))
+    }
+
+    func readFlowScreen(flowKey: String, version: String?, screenKey: String) -> Data? {
+        try? Data(contentsOf: layout.flowScreenFile(flowKey: flowKey, version: version, screenKey: screenKey))
+    }
+
+    @discardableResult
+    func writeFlowScreen(_ data: Data, flowKey: String, version: String?, screenKey: String) -> Bool {
+        atomicWrite(data, to: layout.flowScreenFile(flowKey: flowKey, version: version, screenKey: screenKey))
+    }
+
+    func readFlowStyles(flowKey: String, version: String?) -> [Data]? {
+        guard let blob = try? Data(contentsOf: layout.flowStylesFile(flowKey: flowKey, version: version)) else {
+            return nil
+        }
+        return decodeArrayOfBlobs(blob)
+    }
+
+    @discardableResult
+    func writeFlowStyles(_ blobs: [Data], flowKey: String, version: String?) -> Bool {
+        atomicWrite(encodeArrayOfBlobs(blobs), to: layout.flowStylesFile(flowKey: flowKey, version: version))
+    }
+
+    func readFlowComponents(flowKey: String, version: String?) -> [Data]? {
+        guard let blob = try? Data(contentsOf: layout.flowComponentsFile(flowKey: flowKey, version: version)) else {
+            return nil
+        }
+        return decodeArrayOfBlobs(blob)
+    }
+
+    @discardableResult
+    func writeFlowComponents(_ blobs: [Data], flowKey: String, version: String?) -> Bool {
+        atomicWrite(encodeArrayOfBlobs(blobs), to: layout.flowComponentsFile(flowKey: flowKey, version: version))
+    }
+
     // MARK: - Clear
 
     func clearAll() {

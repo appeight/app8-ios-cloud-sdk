@@ -56,6 +56,8 @@ func telemetryReasonString(_ error: App8Cloud.Error) -> String {
     case .serverError:                 return "server_error"
     case .decodeFailed:                return "decode_failed"
     case .dslVersionUnsupported:        return "dsl_version_unsupported"
+    case .offlineResourceMissing:       return "offline_resource_missing"
+    case .offlineBundleInvalid:         return "offline_bundle_invalid"
     case .engine:                      return "engine_error"
     }
 }

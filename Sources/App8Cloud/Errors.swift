@@ -20,6 +20,14 @@ public extension App8Cloud {
 
         case dslVersionUnsupported(found: String, max: String)
 
+        /// `networkPolicy == .offlineOnly` and the resource wasn't in the cache,
+        /// so the SDK refused to reach the network. `context` names the resource.
+        case offlineResourceMissing(context: String)
+
+        /// An offline `.a8pack` bundle couldn't be imported — malformed manifest,
+        /// unsupported `bundleFormat`, app-id mismatch, or a failed asset checksum.
+        case offlineBundleInvalid(reason: String)
+
         case engine(App8.Error)
 
         // MARK: -
@@ -44,6 +52,11 @@ public extension App8Cloud {
                 return "App8Cloud: decode failed in \(context): \(underlying)."
             case .dslVersionUnsupported(let found, let max):
                 return "App8Cloud: DSL version \(found) > max supported \(max). Upgrade the SDK."
+            case .offlineResourceMissing(let context):
+                return "App8Cloud: offline-only and '\(context)' is not in the cache. " +
+                    "Import an offline bundle or warm the cache while online."
+            case .offlineBundleInvalid(let reason):
+                return "App8Cloud: offline bundle invalid: \(reason)."
             case .engine(let inner):
                 return "App8Cloud: engine error: \(inner.errorDescription ?? "\(inner)")."
             }

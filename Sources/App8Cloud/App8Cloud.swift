@@ -17,6 +17,9 @@ public enum App8Cloud {
     ///     log (subsystem `dev.app8.cloud`). Off by default; turn on during
     ///     integration / debugging.
     ///   - maxSupportedDslVersion: Highest DSL version this build can render.
+    ///   - networkPolicy: Whether the SDK may reach the network. `.offlineOnly`
+    ///     serves exclusively from the cache (seed it via
+    ///     ``Instance/importOfflineBundle(at:)``); defaults to `.online`.
     @MainActor
     public static func instance(
         token: String,
@@ -25,7 +28,8 @@ public enum App8Cloud {
         diskCache: DiskCachePolicy = .default,
         telemetry: TelemetryPolicy = .enabled,
         diagnosticLoggingEnabled: Bool = false,
-        maxSupportedDslVersion: String = "1.0"
+        maxSupportedDslVersion: String = "1.0",
+        networkPolicy: NetworkPolicy = .online
     ) -> Instance {
         A8CInstance(
             token: token,
@@ -34,7 +38,8 @@ public enum App8Cloud {
             diskCachePolicy: diskCache,
             telemetryPolicy: telemetry,
             diagnosticLoggingEnabled: diagnosticLoggingEnabled,
-            maxSupportedDslVersion: maxSupportedDslVersion
+            maxSupportedDslVersion: maxSupportedDslVersion,
+            networkPolicy: networkPolicy
         )
     }
 }

@@ -105,6 +105,26 @@ public extension App8Cloud {
 
         func clearCache(scope: CacheScope) async
 
+        // MARK: Offline bundles
+
+        /// Import an offline `.a8pack` bundle (a directory) into the disk cache.
+        /// Seeds a published flow/screen so it renders with no network, and —
+        /// when online — the normal freshness refresh layers on top. Works as a
+        /// cache warm-up regardless of `networkPolicy`. See
+        /// `Docs/OFFLINE_BUNDLE_FORMAT.md`. Throws on a malformed bundle,
+        /// app-id mismatch, unsupported `bundleFormat`/`dslVersion`, or a failed
+        /// asset checksum.
+        @discardableResult
+        func importOfflineBundle(at url: URL) async throws -> OfflineImportSummary
+
+        /// Import every `.a8pack` found in the default package locations:
+        /// an `App8OfflinePackages/` folder reference in `Bundle.main` (ship-with-app)
+        /// and ``App8Cloud/defaultOfflinePackageDirectory(appId:)`` (downloaded at
+        /// runtime). Returns one summary per successfully imported package;
+        /// a failed package is logged and skipped.
+        @discardableResult
+        func importBundledPackages() async -> [OfflineImportSummary]
+
         // MARK: Screen availability
 
         /// Synchronous, non-blocking. Reflects the SDK's last known catalog
