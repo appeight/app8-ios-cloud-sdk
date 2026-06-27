@@ -72,4 +72,18 @@ public extension App8Cloud {
         case enabled
         case disabled
     }
+
+    /// Controls whether the SDK may reach the network.
+    ///
+    /// - `.online` (default): cache-first, then refresh from the backend — the
+    ///   normal behaviour.
+    /// - `.offlineOnly`: serve exclusively from the on-disk cache (typically
+    ///   seeded via ``Instance/importOfflineBundle(at:)``). Any cache miss
+    ///   throws ``App8Cloud/Error/offlineResourceMissing(context:)`` instead of
+    ///   hitting the network. Use it to prove a bundle renders fully offline,
+    ///   or to ship an offline-first product.
+    enum NetworkPolicy: Sendable {
+        case online
+        case offlineOnly
+    }
 }

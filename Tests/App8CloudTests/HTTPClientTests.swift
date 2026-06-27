@@ -36,6 +36,34 @@ final class HTTPClientTests: XCTestCase {
         )
     }
 
+    func testOfflineOnlyRefusesNetwork() async {
+        let handlerCalled = Locked<Bool>(false)
+        MockURLProtocol.requestHandler = { req in
+            handlerCalled.set(true)
+            return (HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                    Data("{}".utf8))
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let headers = HeaderBuilder(token: "app8_test_abc1234567", sdkVersion: "0.3.0",
+                                    maxSupportedDslVersion: "1.0")
+        let client = HTTPClient(
+            baseURL: URL(string: "https://test.app8.dev/sdk/v1")!,
+            headers: headers, timeout: 5, diagnostics: .disabled,
+            offlineOnly: true,
+            sessionOverride: URLSession(configuration: config)
+        )
+
+        do {
+            _ = try await client.get(.manifest(appId: "app1"))
+            XCTFail("offline-only client should not reach the network")
+        } catch App8Cloud.Error.offlineResourceMissing {
+        } catch {
+            XCTFail("expected offlineResourceMissing, got \(error)")
+        }
+        XCTAssertFalse(handlerCalled.get(), "network handler must never run in offline-only mode")
+    }
+
     func testGetInjectsBearerHeader() async throws {
         let captured = Locked<URLRequest?>(nil)
         MockURLProtocol.requestHandler = { req in

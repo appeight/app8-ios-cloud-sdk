@@ -74,6 +74,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
         telemetryPolicy: App8Cloud.TelemetryPolicy = .enabled,
         diagnosticLoggingEnabled: Bool = false,
         maxSupportedDslVersion: String = "1.0",
+        networkPolicy: App8Cloud.NetworkPolicy = .online,
         requestTimeoutSeconds: TimeInterval = 30,
         urlSessionOverride: URLSession? = nil
     ) {
@@ -126,6 +127,7 @@ final class A8CInstance: App8Cloud.Instance, RenderingBridge {
             headers: headerBuilder,
             timeout: requestTimeoutSeconds,
             diagnostics: log,
+            offlineOnly: networkPolicy == .offlineOnly,
             sessionOverride: urlSessionOverride
         )
 
@@ -1434,5 +1436,37 @@ func deviceIdiomString(_ idiom: UIUserInterfaceIdiom) -> String {
     case .vision:      return "vision"
     case .unspecified: return "unspecified"
     @unknown default:  return "unspecified"
+    }
+}
+
+// MARK: - Offline bundle import
+// Same file as the class so the importer can reach the private cache stores.
+
+extension A8CInstance {
+
+    @discardableResult
+    func importOfflineBundle(at url: URL) async throws -> App8Cloud.OfflineImportSummary {
+        try OfflineBundleImporter.importBundle(
+            directory: url,
+            instanceAppId: appId,
+            maxSupportedDslVersion: maxSupportedDslVersion,
+            diskCache: diskCache,
+            assetCache: assetCache,
+            fontRegistry: fontRegistry,
+            diagnostics: log
+        )
+    }
+
+    @discardableResult
+    func importBundledPackages() async -> [App8Cloud.OfflineImportSummary] {
+        var summaries: [App8Cloud.OfflineImportSummary] = []
+        for url in App8Cloud.discoverOfflinePackages(appId: appId) {
+            do {
+                summaries.append(try await importOfflineBundle(at: url))
+            } catch {
+                log.warning("importBundledPackages: skipped '\(url.lastPathComponent)': \(error)")
+            }
+        }
+        return summaries
     }
 }

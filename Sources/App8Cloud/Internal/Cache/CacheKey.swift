@@ -103,6 +103,42 @@ struct CacheLayout: Sendable {
         rootForApp.appendingPathComponent("screens_catalog.json", isDirectory: false)
     }
 
+    // MARK: - Flow channel (gated multi-screen bundles)
+
+    var flowsDir: URL {
+        rootForApp.appendingPathComponent("flows", isDirectory: true)
+    }
+
+    /// `flows/{flowKey}/{version}/` — version-scoped so a flow can hold more
+    /// than one published version on disk. `_latest` sentinel when nil.
+    func flowVersionDir(flowKey: String, version: String?) -> URL {
+        let v = version ?? Self.latestVersionSentinel
+        return flowsDir
+            .appendingPathComponent(sanitizedPathComponent(flowKey), isDirectory: true)
+            .appendingPathComponent(sanitizedPathComponent(v), isDirectory: true)
+    }
+
+    func flowManifestFile(flowKey: String, version: String?) -> URL {
+        flowVersionDir(flowKey: flowKey, version: version)
+            .appendingPathComponent("manifest.json", isDirectory: false)
+    }
+
+    func flowStylesFile(flowKey: String, version: String?) -> URL {
+        flowVersionDir(flowKey: flowKey, version: version)
+            .appendingPathComponent("styles.json", isDirectory: false)
+    }
+
+    func flowComponentsFile(flowKey: String, version: String?) -> URL {
+        flowVersionDir(flowKey: flowKey, version: version)
+            .appendingPathComponent("components.json", isDirectory: false)
+    }
+
+    func flowScreenFile(flowKey: String, version: String?, screenKey: String) -> URL {
+        flowVersionDir(flowKey: flowKey, version: version)
+            .appendingPathComponent("screens", isDirectory: true)
+            .appendingPathComponent("\(sanitizedPathComponent(screenKey)).json", isDirectory: false)
+    }
+
     var lruDir: URL {
         rootForApp.appendingPathComponent("lru", isDirectory: true)
     }

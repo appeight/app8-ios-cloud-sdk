@@ -308,17 +308,33 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
 
     /// Fetch a published flow's lazy manifest (entry screen + member list).
     func getFlowManifest(flowKey: String, version: String?) async throws -> FlowManifestResponse {
+        // Network-first (keeps online flows fresh), with a disk fallback so a
+        // seeded/imported bundle renders offline. `.offlineOnly` makes the
+        // network call throw instantly, dropping straight to disk.
         let identity = await readIdentity()
         let endpoint = Endpoint.flow(appId: appId, flowKey: flowKey, version: version)
         let client = self.client
-        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
-            let result = try await client.get(endpoint, identity: identity)
-            return result.data
-        }
         do {
-            return try JSONDecoder().decode(FlowManifestResponse.self, from: raw)
+            let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+                let result = try await client.get(endpoint, identity: identity)
+                return result.data
+            }
+            let decoded: FlowManifestResponse
+            do {
+                decoded = try JSONDecoder().decode(FlowManifestResponse.self, from: raw)
+            } catch {
+                throw App8Cloud.Error.decodeFailed(context: "FlowManifestResponse", underlying: error)
+            }
+            cache?.writeFlowManifest(raw, flowKey: flowKey, version: version)
+            return decoded
         } catch {
-            throw App8Cloud.Error.decodeFailed(context: "FlowManifestResponse", underlying: error)
+            if let disk = cache?.readFlowManifest(flowKey: flowKey, version: version),
+               let decoded = try? JSONDecoder().decode(FlowManifestResponse.self, from: disk)
+            {
+                log.debug("getFlowManifest('\(flowKey)'): served from disk after network error: \(error)")
+                return decoded
+            }
+            throw error
         }
     }
 
@@ -332,18 +348,28 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         let identity = await readIdentity()
         let endpoint = Endpoint.flowScreen(appId: appId, flowKey: flowKey, screenKey: screenKey, version: version)
         let client = self.client
-        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
-            let result = try await client.get(endpoint, identity: identity)
-            return result.data
-        }
-        let response: ScreenRenderResponse
         do {
-            response = try JSONDecoder().decode(ScreenRenderResponse.self, from: raw)
+            let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+                let result = try await client.get(endpoint, identity: identity)
+                return result.data
+            }
+            let response: ScreenRenderResponse
+            do {
+                response = try JSONDecoder().decode(ScreenRenderResponse.self, from: raw)
+            } catch {
+                throw App8Cloud.Error.decodeFailed(context: "FlowScreenRenderResponse", underlying: error)
+            }
+            flowScreenState.withLock { $0[key] = response.data }
+            cache?.writeFlowScreen(response.data, flowKey: flowKey, version: version, screenKey: screenKey)
+            return response.data
         } catch {
-            throw App8Cloud.Error.decodeFailed(context: "FlowScreenRenderResponse", underlying: error)
+            if let disk = cache?.readFlowScreen(flowKey: flowKey, version: version, screenKey: screenKey) {
+                flowScreenState.withLock { $0[key] = disk }
+                log.debug("getFlowScreenData('\(flowKey)/\(screenKey)'): served from disk after network error: \(error)")
+                return disk
+            }
+            throw error
         }
-        flowScreenState.withLock { $0[key] = response.data }
-        return response.data
     }
 
     /// Fetch the flow's pinned styles (backend falls back to app-level latest
@@ -353,14 +379,25 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         let identity = await readIdentity()
         let endpoint = Endpoint.flowStyles(appId: appId, flowKey: flowKey, version: version)
         let client = self.client
-        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
-            let result = try await client.get(endpoint, identity: identity)
-            return result.data
-        }
         do {
-            return try JSONDecoder().decode(StyleArrayResponse.self, from: raw).items
+            let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+                let result = try await client.get(endpoint, identity: identity)
+                return result.data
+            }
+            let items: [Data]
+            do {
+                items = try JSONDecoder().decode(StyleArrayResponse.self, from: raw).items
+            } catch {
+                throw App8Cloud.Error.decodeFailed(context: "FlowStyleArrayResponse", underlying: error)
+            }
+            cache?.writeFlowStyles(items, flowKey: flowKey, version: version)
+            return items
         } catch {
-            throw App8Cloud.Error.decodeFailed(context: "FlowStyleArrayResponse", underlying: error)
+            if let disk = cache?.readFlowStyles(flowKey: flowKey, version: version) {
+                log.debug("getFlowStyles('\(flowKey)'): served from disk after network error: \(error)")
+                return disk
+            }
+            throw error
         }
     }
 
@@ -369,14 +406,25 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         let identity = await readIdentity()
         let endpoint = Endpoint.flowComponents(appId: appId, flowKey: flowKey, version: version)
         let client = self.client
-        let raw = try await coalescer.run(key: endpoint.coalesceKey) {
-            let result = try await client.get(endpoint, identity: identity)
-            return result.data
-        }
         do {
-            return try JSONDecoder().decode(ComponentArrayResponse.self, from: raw).items
+            let raw = try await coalescer.run(key: endpoint.coalesceKey) {
+                let result = try await client.get(endpoint, identity: identity)
+                return result.data
+            }
+            let items: [Data]
+            do {
+                items = try JSONDecoder().decode(ComponentArrayResponse.self, from: raw).items
+            } catch {
+                throw App8Cloud.Error.decodeFailed(context: "FlowComponentArrayResponse", underlying: error)
+            }
+            cache?.writeFlowComponents(items, flowKey: flowKey, version: version)
+            return items
         } catch {
-            throw App8Cloud.Error.decodeFailed(context: "FlowComponentArrayResponse", underlying: error)
+            if let disk = cache?.readFlowComponents(flowKey: flowKey, version: version) {
+                log.debug("getFlowComponents('\(flowKey)'): served from disk after network error: \(error)")
+                return disk
+            }
+            throw error
         }
     }
 

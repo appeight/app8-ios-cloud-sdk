@@ -17,6 +17,12 @@ final class HTTPClient: @unchecked Sendable {
     private let headers: HeaderBuilder
     private let log: Diagnostics
 
+    /// When true (`networkPolicy == .offlineOnly`) every request short-circuits
+    /// to `offlineResourceMissing` before touching the network. Because all SDK
+    /// reads are cache-first, cache hits return before reaching here — only a
+    /// genuine miss surfaces the offline error.
+    private let offlineOnly: Bool
+
     /// Post-download cap on one response body so a misbehaving backend can't
     /// make the SDK decode/cache an unbounded blob.
     private let maxResponseBytes = 32 * 1024 * 1024
@@ -26,8 +32,10 @@ final class HTTPClient: @unchecked Sendable {
         headers: HeaderBuilder,
         timeout: TimeInterval,
         diagnostics: Diagnostics,
+        offlineOnly: Bool = false,
         sessionOverride: URLSession? = nil
     ) {
+        self.offlineOnly = offlineOnly
         if let override = sessionOverride {
             self.session = override
         } else {
@@ -51,7 +59,8 @@ final class HTTPClient: @unchecked Sendable {
         _ endpoint: Endpoint,
         identity: [String: String]? = nil
     ) async throws -> HTTPResult {
-        try await sendWithRetry { [self] in
+        try guardOffline(endpoint.coalesceKey)
+        return try await sendWithRetry { [self] in
             let url = endpoint.resolve(against: baseURL)
             var req = URLRequest(url: url)
             req.httpMethod = endpoint.method
@@ -67,7 +76,8 @@ final class HTTPClient: @unchecked Sendable {
         body: Data,
         identity: [String: String]? = nil
     ) async throws -> HTTPResult {
-        try await sendWithRetry { [self] in
+        try guardOffline(endpoint.coalesceKey)
+        return try await sendWithRetry { [self] in
             let url = endpoint.resolve(against: baseURL)
             var req = URLRequest(url: url)
             req.httpMethod = endpoint.method
@@ -81,7 +91,8 @@ final class HTTPClient: @unchecked Sendable {
 
     /// Does NOT include the SDK token — presigned URLs carry their own auth.
     func getRawURL(_ url: URL) async throws -> HTTPResult {
-        try await sendWithRetry { [self] in
+        try guardOffline("asset:\(url.host ?? "")\(url.path)")
+        return try await sendWithRetry { [self] in
             var req = URLRequest(url: url)
             req.httpMethod = "GET"
             req.setValue(headers.standardHeaders()["User-Agent"], forHTTPHeaderField: "User-Agent")
@@ -91,6 +102,14 @@ final class HTTPClient: @unchecked Sendable {
     }
 
     // MARK: - Internals
+
+    /// In offline-only mode, refuse the network before any request work.
+    private func guardOffline(_ context: String) throws {
+        if offlineOnly {
+            log.debug("HTTP suppressed (offlineOnly): \(context)")
+            throw App8Cloud.Error.offlineResourceMissing(context: context)
+        }
+    }
 
     private func send(_ request: URLRequest, endpoint: Endpoint) async throws -> HTTPResult {
         let (data, urlResponse) = try await session.data(for: request)
