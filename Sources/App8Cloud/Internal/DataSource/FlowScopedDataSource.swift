@@ -100,6 +100,9 @@ final class FlowScopedDataSource: App8DataSource, @unchecked Sendable {
         // render time; fall back to the app-level datasource cache otherwise.
         try await parent.getDatasource(screenId: screenId, datasourceId: datasourceId)
     }
+    func reloadDatasource(screenId: String, datasourceId: String) async throws -> Data {
+        try await parent.reloadDatasource(screenId: screenId, datasourceId: datasourceId)
+    }
     // Localizations stay app-level for v1: they're app-wide (all locales × keys)
     // and the public localization channel serves latest, so per-flow pinning is
     // deferred (would need a `published_flow_version_localizations` table +

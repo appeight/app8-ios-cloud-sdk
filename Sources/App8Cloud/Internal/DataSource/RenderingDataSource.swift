@@ -34,6 +34,9 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         var componentsLoaded = false
         var screensByCacheKey: [String: Data] = [:]
         var datasources: [String: Data] = [:]
+        /// The screen whose render response last carried each datasource
+        /// path: `reloadDatasource` refetches it for fresh bytes.
+        var datasourceScreens: [String: String] = [:]
         var allScreenIds: [String] = []
         var localizations: Data?
     }
@@ -124,6 +127,7 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 s.componentsLoaded = false
                 s.screensByCacheKey = [:]
                 s.datasources = [:]
+                s.datasourceScreens = [:]
                 s.allScreenIds = []
                 s.localizations = nil
             }
@@ -237,6 +241,46 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
         }
         throw App8Cloud.Error.decodeFailed(
             context: "getDatasource(\(datasourceId))",
+            underlying: NoBlobError()
+        )
+    }
+
+    /// The DSL `reloadDatasource` action: fresh bytes, never the cache.
+    /// Datasources arrive inline in a screen's render response, so this
+    /// refetches that response from the network (`screenId`, else the screen
+    /// that last carried the datasource, which covers app variables with an
+    /// empty `screenId`) and returns the datasource it carries. Throws when
+    /// no screen is known to carry it or the fetch fails, so the action's
+    /// `onError` runs instead of reporting stale data as reloaded.
+    func reloadDatasource(screenId: String, datasourceId: String) async throws -> Data {
+        let owner = state.withLock { $0.datasourceScreens[datasourceId] }
+        var candidates: [String] = []
+        if !screenId.isEmpty { candidates.append(screenId) }
+        if let owner, !owner.isEmpty, owner != screenId { candidates.append(owner) }
+        var lastError: Swift.Error?
+        for candidate in candidates {
+            do {
+                let version = await readPinnedVersion(screenId: candidate)
+                let response = try await fetchScreenResponse(screenId: candidate, version: version)
+                applyScreenResponse(
+                    response,
+                    screenId: candidate,
+                    requestedVersion: version,
+                    expected: nil,
+                    existingMeta: cache?.readScreenMeta(screenId: candidate),
+                    contentHash: ContentHash.sha256Hex(response.data),
+                    skipDiskWrite: false
+                )
+                if let fresh = response.datasources?[datasourceId] {
+                    log.debug("[Datasource] reloaded '\(datasourceId)' via screen '\(candidate)'")
+                    return fresh
+                }
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? App8Cloud.Error.decodeFailed(
+            context: "reloadDatasource(\(datasourceId))",
             underlying: NoBlobError()
         )
     }
@@ -991,7 +1035,10 @@ final class RenderingDataSource: App8DataSource, @unchecked Sendable {
                 s.componentsLoaded = true
             }
             if let dss = response.datasources {
-                for (path, blob) in dss { s.datasources[path] = blob }
+                for (path, blob) in dss {
+                    s.datasources[path] = blob
+                    s.datasourceScreens[path] = screenId
+                }
             }
         }
         if !skipDiskWrite {
